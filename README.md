@@ -11,22 +11,21 @@ Automated tool to download WhatsApp Connections game screenshots and analyze sco
 - Produces CSV report with all results
 - Calculates per-user score totals
 
-## Requirements
+## Initial Setup (one time)
 
 ```bash
-# Install dependencies
-pip install playwright opencv-python numpy
-
-# Install Playwright browsers
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 playwright install chromium
 ```
 
 ## Usage
 
-### Basic Command
-
 ```bash
+source .venv/bin/activate
 python score-analyzer.py --from=2025-12-12 --to=2025-12-25
+deactivate  # when done
 ```
 
 ### What It Does
