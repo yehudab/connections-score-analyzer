@@ -5,7 +5,7 @@ Automated tool to download WhatsApp Connections game screenshots and analyze sco
 ## Features
 
 - Downloads images from WhatsApp Web for a specified date range
-- Detects and scores Connections game results using CV (94.1% accuracy)
+- Detects and scores Connections game results using CV (99%+ accuracy)
 - Validates detections with strict quality checks
 - Generates debug visualizations for all images
 - Produces CSV report with all results

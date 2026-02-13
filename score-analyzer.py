@@ -233,6 +233,10 @@ def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug')
     )
 
     combined_mask = cv2.bitwise_or(cv2.bitwise_or(green_mask, grey_mask), red_mask)
+    # Morphological opening to break thin pixel bridges (anti-aliasing/compression artifacts)
+    # that can merge separate bars into one giant contour
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     # Filter contours to find score bars
@@ -244,7 +248,13 @@ def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug')
         in_content_v = height * 0.15 < y < height * 0.95
         in_content_h = x > width * 0.05
 
-        if in_content_v and in_content_h and 20 < h < 80 and 15 < w < 400 and area > 400:
+        if in_content_v and in_content_h and 20 < h < 80 and 10 < w < 400 and area > 200:
+            # Fix 1: Rectangularity filter - reject annotations (circles, etc.)
+            contour_area = cv2.contourArea(c)
+            rect_fill_ratio = contour_area / area if area > 0 else 0
+            if rect_fill_ratio < 0.55:
+                continue
+
             bar_region_hsv = hsv[y:y+h, x:x+w]
 
             green_pixels = cv2.bitwise_or(
@@ -262,13 +272,19 @@ def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug')
             is_green = green_ratio > 0.02 and green_ratio > red_ratio
             is_red = red_ratio > 0.15
 
-            # Color density check
+            # Fix 2: Relaxed dark_ratio - skip check for colored bars
             bar_region_gray = cv2.cvtColor(cropped_img[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
             dark_pixels = np.sum(bar_region_gray < 220)
             dark_ratio = dark_pixels / area
 
-            if dark_ratio < 0.40:
-                continue
+            has_color_signal = green_ratio > 0.01 or red_ratio > 0.10
+            if not has_color_signal:
+                # For grey bars: try relaxed threshold as fallback
+                if dark_ratio < 0.40:
+                    dark_pixels_relaxed = np.sum(bar_region_gray < 240)
+                    dark_ratio_relaxed = dark_pixels_relaxed / area
+                    if dark_ratio_relaxed < 0.30:
+                        continue
 
             bars.append({
                 'x': x, 'y': y, 'w': w, 'h': h, 'area': area,
@@ -292,8 +308,10 @@ def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug')
 
     bars = sorted(unique_bars, key=lambda b: b['center_y'])
 
-    # Pre-filter by alignment groups
+    # Fix 3: Restrict bars to chart area - find best 8-bar cluster first,
+    # then filter out bars outside its vertical range
     if len(bars) > 8:
+        # First try alignment groups to narrow down
         alignment_groups = []
         tolerance = 50
         for bar in bars:
@@ -313,8 +331,44 @@ def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug')
             if len(largest_group) >= 8:
                 bars = sorted(largest_group, key=lambda b: b['center_y'])
 
+    # If still >8, find best 8-bar cluster by spacing+alignment and restrict vertical range
+    if len(bars) > 8:
+        best_cluster = None
+        best_quality = -1000
+        for start_idx in range(len(bars) - 7):
+            cluster = bars[start_idx:start_idx + 8]
+            spacings = [cluster[i+1]['center_y'] - cluster[i]['center_y'] for i in range(7)]
+            avg_spacing = np.mean(spacings)
+            if avg_spacing <= 0:
+                continue
+            spacing_cv = np.std(spacings) / avg_spacing
+            right_edges = [b['x'] + b['w'] for b in cluster]
+            right_edge_cv = np.std(right_edges) / np.mean(right_edges) if np.mean(right_edges) > 0 else 1.0
+            quality = 500 - right_edge_cv * 1000 - spacing_cv * 400
+            if quality > best_quality:
+                best_quality = quality
+                best_cluster = cluster
+        if best_cluster is not None:
+            # Filter bars to only those within the cluster's vertical range (with margin)
+            cluster_top = best_cluster[0]['center_y']
+            cluster_bottom = best_cluster[-1]['center_y']
+            v_range = cluster_bottom - cluster_top
+            margin = v_range * 0.10
+            bars = [b for b in bars if cluster_top - margin <= b['center_y'] <= cluster_bottom + margin]
+            bars = sorted(bars, key=lambda b: b['center_y'])
+
     # Find best cluster of 8 bars
     if len(bars) < 8:
+        # Fix 4: Non-game image detection
+        if len(bars) < 4 and content_region is None:
+            return None, "failed:not_a_game"
+        if 4 <= len(bars) < 8 and content_region is None:
+            # Check height consistency - real bars have similar heights
+            if len(bars) >= 2:
+                heights = [b['h'] for b in bars]
+                height_cv = np.std(heights) / np.mean(heights) if np.mean(heights) > 0 else 1.0
+                if height_cv > 0.3:
+                    return None, "failed:not_a_game"
         return None, f"failed:only_{len(bars)}_bars"
     elif len(bars) >= 8:
         best_cluster = None
@@ -348,7 +402,7 @@ def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug')
                     quality += 50
                 if 35 < avg_spacing < 95:
                     quality += 50
-                if right_edge_cv > 0.05:
+                if right_edge_cv > 0.08:
                     quality -= 500
 
                 if quality > best_score_quality:
@@ -390,7 +444,7 @@ def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug')
             std_spacing = np.std(spacings)
             spacing_cv = (std_spacing / avg_spacing) if avg_spacing > 0 else 0
 
-            if spacing_cv > 0.10:
+            if spacing_cv > 0.18:
                 return None, f"failed:spacing_cv_{spacing_cv:.1%}"
 
     # Alignment validation
@@ -400,7 +454,7 @@ def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug')
         std_right_edge = np.std(right_edges)
         right_edge_cv = (std_right_edge / avg_right_edge) if avg_right_edge > 0 else 0
 
-        if right_edge_cv > 0.05:
+        if right_edge_cv > 0.08:
             return None, f"failed:alignment_cv_{right_edge_cv:.1%}"
 
     # Draw debug image
@@ -475,6 +529,8 @@ def main():
                         help='Start date in YYYY-MM-DD format')
     parser.add_argument('--to', dest='to_date', type=str, required=True,
                         help='End date in YYYY-MM-DD format')
+    parser.add_argument('--rescore', action='store_true',
+                        help='Re-run scoring on already-downloaded images without downloading')
 
     args = parser.parse_args()
 
@@ -489,8 +545,13 @@ def main():
     date_range_str = f"{from_date}_{to_date}"
     base_dir = os.path.join("images", date_range_str)
     src_dir = os.path.join(base_dir, "src")
-    debug_dir = os.path.join(base_dir, "debug")
-    csv_path = os.path.join(base_dir, "scores.csv")
+
+    if args.rescore:
+        debug_dir = os.path.join(base_dir, "debug-v2")
+        csv_path = os.path.join(base_dir, "scores-v2.csv")
+    else:
+        debug_dir = os.path.join(base_dir, "debug")
+        csv_path = os.path.join(base_dir, "scores.csv")
 
     os.makedirs(src_dir, exist_ok=True)
     os.makedirs(debug_dir, exist_ok=True)
@@ -499,18 +560,88 @@ def main():
     print(f"Connections Score Analyzer")
     print(f"Date Range: {from_date} to {to_date}")
     print(f"Output Directory: {base_dir}")
+    if args.rescore:
+        print(f"Mode: RESCORE (debug-v2/, scores-v2.csv)")
     print(f"{'='*70}")
 
-    # Download images
-    images_metadata = download_images(from_date, to_date, src_dir)
+    if args.rescore:
+        # Read existing images from src/ directory
+        if not os.path.isdir(src_dir):
+            print(f"\nError: Source directory not found: {src_dir}")
+            return 1
 
-    if not images_metadata:
-        print("\nNo images downloaded.")
-        return 0
+        # Load original CSV to get date/time metadata and row order
+        original_csv_path = os.path.join(base_dir, "scores.csv")
+        orig_rows = []
+        if os.path.isfile(original_csv_path):
+            with open(original_csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    orig_rows.append(row)
+            print(f"Loaded {len(orig_rows)} entries from original scores.csv")
 
-    print(f"\n{'='*70}")
-    print(f"Downloaded {len(images_metadata)} images")
-    print(f"{'='*70}")
+        # Build set of available image files by UUID
+        import glob as glob_mod
+        available_files = {}
+        for filepath in glob_mod.glob(os.path.join(src_dir, "*.png")):
+            filename = os.path.basename(filepath)
+            name_no_ext = os.path.splitext(filename)[0]
+            parts = name_no_ext.split('_', 1)
+            uuid = parts[0]
+            sender = parts[1] if len(parts) == 2 else "Unknown"
+            available_files[uuid] = {'filepath': filepath, 'filename': filename, 'sender': sender}
+
+        # Build metadata list in original CSV order, then append any files not in CSV
+        images_metadata = []
+        seen_uuids = set()
+        for row in orig_rows:
+            uuid = row['image_uuid']
+            if uuid in available_files:
+                seen_uuids.add(uuid)
+                date_str = row.get('date', '')
+                try:
+                    img_date = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else from_date
+                except ValueError:
+                    img_date = from_date
+                images_metadata.append({
+                    'filename': available_files[uuid]['filename'],
+                    'sender': row.get('user_name', '') or available_files[uuid]['sender'],
+                    'date_text': row.get('time', ''),
+                    'date': img_date,
+                    'uuid': uuid,
+                    'filepath': available_files[uuid]['filepath']
+                })
+
+        # Append any images not in the original CSV (sorted by filename)
+        for uuid in sorted(available_files, key=lambda u: available_files[u]['filename']):
+            if uuid not in seen_uuids:
+                images_metadata.append({
+                    'filename': available_files[uuid]['filename'],
+                    'sender': available_files[uuid]['sender'],
+                    'date_text': '',
+                    'date': from_date,
+                    'uuid': uuid,
+                    'filepath': available_files[uuid]['filepath']
+                })
+
+        if not images_metadata:
+            print(f"\nNo .png files found in {src_dir}")
+            return 0
+
+        print(f"\n{'='*70}")
+        print(f"Found {len(images_metadata)} images for rescoring")
+        print(f"{'='*70}")
+    else:
+        # Download images
+        images_metadata = download_images(from_date, to_date, src_dir)
+
+        if not images_metadata:
+            print("\nNo images downloaded.")
+            return 0
+
+        print(f"\n{'='*70}")
+        print(f"Downloaded {len(images_metadata)} images")
+        print(f"{'='*70}")
 
     # Create CSV and process images
     print("\nProcessing images and detecting scores...")
