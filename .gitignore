@@ -1,0 +1,17 @@
+# Downloaded images and debug output
+images/
+images-debug/
+
+# WhatsApp browser session data
+whatsapp-session/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Claude
+.claude/
