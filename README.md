@@ -99,6 +99,89 @@ Debug images show:
 
 Failed images are saved with `_debug.png` suffix and show which bars were detected.
 
+## PicoClaw Bot Integration
+
+This project runs as a sidecar HTTP service alongside the [PicoClaw](https://github.com/sipeed/picoclaw) WhatsApp bot. The bot receives images from the WhatsApp group, calls the scorer API, and posts the results back.
+
+### Architecture
+
+```
+WhatsApp group → picoclaw-gateway (Go bot)
+                      ↓  POST /score (multipart image)
+                 connections-scorer (Flask, this repo)
+                      ↓
+                 SQLite DB (/data/scores.db)
+```
+
+Both containers share a Docker network (`botnet`). The bot reaches the scorer at `http://scorer:5000`.
+
+### API Reference
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/score` | Submit image for scoring. Fields: `image` (file), `user_id`, `user_name` |
+| `GET` | `/leaderboard?sprint=current` | Rankings for a sprint |
+| `GET` | `/stats?user_id=X&sprint=current` | Personal stats |
+| `GET` | `/summary?sprint=current` | Formatted sprint summary text |
+| `GET` | `/missing` | Members who haven't submitted today (Israel time) |
+| `GET` | `/sprint` | Current sprint ID, dates, days remaining |
+| `GET` | `/config/sprint_epoch` | View sprint start date |
+| `PUT` | `/config/sprint_epoch` | Update sprint start date |
+| `GET` | `/health` | Health check |
+
+### Curling the API
+
+Use the picoclaw-gateway container (which has `curl`) to call the scorer.
+This also verifies the Docker network between the two containers is working:
+
+```bash
+sudo docker exec -it picoclaw-gateway sh
+
+# Health check
+curl http://scorer:5000/health
+
+# Current sprint info
+curl http://scorer:5000/sprint
+
+# Who hasn't submitted today?
+curl http://scorer:5000/missing
+
+# Leaderboard
+curl http://scorer:5000/leaderboard?sprint=current
+
+# Sprint summary
+curl http://scorer:5000/summary?sprint=current
+
+# Update sprint epoch
+curl -X PUT http://scorer:5000/config/sprint_epoch \
+  -H "Content-Type: application/json" \
+  -d '{"date": "2025-12-12"}'
+
+# Score an image manually (image must exist inside the picoclaw-gateway container)
+curl -X POST http://scorer:5000/score \
+  -F "image=@/home/picoclaw/.picoclaw/workspace/media/some-image.jpg" \
+  -F "user_id=972500000000" \
+  -F "user_name=Alice"
+```
+
+### Sprint Configuration
+
+Sprints are 14-day periods starting from the epoch date (stored in the DB).
+To update after deploy:
+
+```bash
+sudo docker exec -it connections-scorer sh
+curl -X PUT http://scorer:5000/config/sprint_epoch \
+  -H "Content-Type: application/json" \
+  -d '{"date": "2026-02-06"}'
+```
+
+### Daily Reminder Cron
+
+The bot is configured to call `GET /missing` at 21:00 Israel time every day
+and send a reminder to the group for members who haven't submitted yet.
+The cron job is managed by the PicoClaw cron tool inside the bot container.
+
 ## Troubleshooting
 
 **"No image found"**: Make sure you're in the media viewer with an image open

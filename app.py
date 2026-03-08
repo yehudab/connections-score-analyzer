@@ -189,13 +189,16 @@ def leaderboard():
 
     with db() as conn:
         rows = conn.execute("""
-            SELECT user_name,
+            SELECT user_id,
+                   (SELECT user_name FROM plays p2
+                    WHERE p2.user_id = p.user_id
+                    ORDER BY played_at DESC LIMIT 1) AS user_name,
                    COUNT(*) AS plays,
                    SUM(score) AS total_score,
                    MAX(score) AS best_score
-            FROM plays
+            FROM plays p
             WHERE sprint_id = ? AND scan_status = 'success'
-            GROUP BY user_id, user_name
+            GROUP BY user_id
             ORDER BY total_score DESC
         """, (sid,)).fetchall()
 
@@ -239,13 +242,16 @@ def summary():
 
     with db() as conn:
         rows = conn.execute("""
-            SELECT user_name,
+            SELECT user_id,
+                   (SELECT user_name FROM plays p2
+                    WHERE p2.user_id = p.user_id
+                    ORDER BY played_at DESC LIMIT 1) AS user_name,
                    COUNT(*) AS plays,
                    SUM(score) AS total_score,
                    MAX(score) AS best_score
-            FROM plays
+            FROM plays p
             WHERE sprint_id = ? AND scan_status = 'success'
-            GROUP BY user_id, user_name
+            GROUP BY user_id
             ORDER BY total_score DESC
         """, (sid,)).fetchall()
 
