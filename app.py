@@ -6,8 +6,9 @@ Flask HTTP API wrapping scorer.py with SQLite persistence.
 import os
 import sqlite3
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 
 from flask import Flask, request, jsonify
 
@@ -16,7 +17,18 @@ from scorer import compute_score_from_bar_image
 app = Flask(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "/data/scores.db")
-SPRINT_EPOCH_DEFAULT = "2026-03-07"
+SPRINT_EPOCH_DEFAULT = "2026-02-06"
+IL_TZ = ZoneInfo("Asia/Jerusalem")
+
+
+def now_il() -> datetime:
+    """Current datetime in Israel time."""
+    return datetime.now(IL_TZ)
+
+
+def today_il() -> date:
+    """Current date in Israel time."""
+    return now_il().date()
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +56,15 @@ def db():
         conn.close()
 
 
+def today_il_utc_range() -> tuple[datetime, datetime]:
+    """Return the UTC start and end of today in Israel time."""
+    il_today = today_il()
+    il_start = datetime(il_today.year, il_today.month, il_today.day, tzinfo=IL_TZ)
+    utc_start = il_start.astimezone(timezone.utc)
+    utc_end = utc_start + timedelta(days=1)
+    return utc_start, utc_end
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with db() as conn:
@@ -56,6 +77,12 @@ def init_db():
                 score       INTEGER,
                 scan_status TEXT NOT NULL,
                 sprint_id   INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS members (
+                user_id   TEXT PRIMARY KEY,
+                user_name TEXT NOT NULL,
+                added_at  DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS config (
@@ -76,7 +103,7 @@ def get_sprint_epoch():
 
 def current_sprint_id():
     epoch = get_sprint_epoch()
-    return (date.today() - epoch).days // 14
+    return (today_il() - epoch).days // 14
 
 
 def sprint_date_range(sprint_id):
@@ -109,7 +136,7 @@ def sprint_info():
         "sprint_id": sid,
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "days_remaining": (end - date.today()).days + 1,
+        "days_remaining": (end - today_il()).days + 1,
     })
 
 
@@ -140,6 +167,13 @@ def score():
             """INSERT INTO plays (user_id, user_name, score, scan_status, sprint_id)
                VALUES (?, ?, ?, ?, ?)""",
             (user_id, user_name, computed_score, status, sprint_id),
+        )
+        # Track member (upsert — update name in case it changed)
+        conn.execute(
+            """INSERT INTO members (user_id, user_name)
+               VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET user_name=excluded.user_name""",
+            (user_id, user_name),
         )
 
     if status == "success":
@@ -225,6 +259,75 @@ def summary():
         "end": end.isoformat(),
         "text": "\n".join(lines),
         "rankings": [dict(r) for r in rows],
+    })
+
+
+@app.get("/config/sprint_epoch")
+def get_sprint_epoch_endpoint():
+    epoch = get_sprint_epoch()
+    sid = current_sprint_id()
+    start, end = sprint_date_range(sid)
+    return jsonify({
+        "sprint_epoch": epoch.isoformat(),
+        "current_sprint_id": sid,
+        "current_sprint_start": start.isoformat(),
+        "current_sprint_end": end.isoformat(),
+    })
+
+
+@app.put("/config/sprint_epoch")
+def set_sprint_epoch():
+    data = request.get_json()
+    if not data or "date" not in data:
+        return jsonify({"error": "body must be {\"date\": \"YYYY-MM-DD\"}"}), 400
+    try:
+        new_epoch = date.fromisoformat(data["date"])
+    except ValueError:
+        return jsonify({"error": "invalid date format, use YYYY-MM-DD"}), 400
+
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('sprint_epoch', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (new_epoch.isoformat(),),
+        )
+
+    sid = (today_il() - new_epoch).days // 14
+    start, end = sprint_date_range(sid)
+    return jsonify({
+        "sprint_epoch": new_epoch.isoformat(),
+        "current_sprint_id": sid,
+        "current_sprint_start": start.isoformat(),
+        "current_sprint_end": end.isoformat(),
+    })
+
+
+@app.get("/missing")
+def missing():
+    """Return members who haven't submitted a screenshot today (Israel time)."""
+    utc_start, utc_end = today_il_utc_range()
+    date_il = today_il().isoformat()
+
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT m.user_id, m.user_name
+            FROM members m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM plays p
+                WHERE p.user_id = m.user_id
+                  AND p.played_at >= ?
+                  AND p.played_at <  ?
+            )
+            ORDER BY m.user_name
+        """, (
+            utc_start.strftime("%Y-%m-%d %H:%M:%S"),
+            utc_end.strftime("%Y-%m-%d %H:%M:%S"),
+        )).fetchall()
+
+    return jsonify({
+        "date": date_il,
+        "missing": [dict(r) for r in rows],
+        "count": len(rows),
     })
 
 
