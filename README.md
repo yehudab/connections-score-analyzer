@@ -182,6 +182,27 @@ The bot is configured to call `GET /missing` at 21:00 Israel time every day
 and send a reminder to the group for members who haven't submitted yet.
 The cron job is managed by the PicoClaw cron tool inside the bot container.
 
+### Viewing Container Logs
+
+Logs persist as long as the container exists (even when stopped), but are lost on `docker compose down`.
+
+```bash
+# Check if container still exists
+sudo docker ps -a | grep picoclaw-gateway
+
+# View logs (works even when container is stopped)
+sudo docker logs picoclaw-gateway
+
+# Last 200 lines with timestamps
+sudo docker logs picoclaw-gateway --timestamps --tail 200
+
+# Follow live logs
+sudo docker logs picoclaw-gateway --follow
+```
+
+The `logging` driver in `docker-compose.yml` keeps up to 50MB of history (5 × 10MB files),
+so logs survive container restarts.
+
 ## Troubleshooting
 
 **"No image found"**: Make sure you're in the media viewer with an image open
