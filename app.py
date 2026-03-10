@@ -74,6 +74,7 @@ def init_db():
                 played_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 user_id     TEXT NOT NULL,
                 user_name   TEXT NOT NULL,
+                chat_id     TEXT,
                 score       INTEGER,
                 scan_status TEXT NOT NULL,
                 sprint_id   INTEGER NOT NULL
@@ -93,6 +94,11 @@ def init_db():
             INSERT OR IGNORE INTO config (key, value)
             VALUES ('sprint_epoch', '""" + SPRINT_EPOCH_DEFAULT + """');
         """)
+        # Migrate: add chat_id column if it doesn't exist yet
+        try:
+            conn.execute("ALTER TABLE plays ADD COLUMN chat_id TEXT")
+        except Exception:
+            pass  # Column already exists
 
 
 def get_sprint_epoch():
@@ -147,6 +153,7 @@ def score():
 
     user_id = request.form.get("user_id", "unknown")
     user_name = request.form.get("user_name", user_id)
+    chat_id = request.form.get("chat_id")
 
     image_file = request.files["image"]
     suffix = os.path.splitext(image_file.filename or "img.jpg")[1] or ".jpg"
@@ -164,9 +171,9 @@ def score():
 
     with db() as conn:
         conn.execute(
-            """INSERT INTO plays (user_id, user_name, score, scan_status, sprint_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            (user_id, user_name, computed_score, status, sprint_id),
+            """INSERT INTO plays (user_id, user_name, chat_id, score, scan_status, sprint_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, user_name, chat_id, computed_score, status, sprint_id),
         )
         # Track member (upsert — update name in case it changed)
         conn.execute(
@@ -182,25 +189,85 @@ def score():
         return jsonify({"score": None, "status": status, "sprint_id": sprint_id}), 422
 
 
+@app.post("/score/correct")
+def correct_score():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "missing JSON body"}), 400
+
+    user_id = data.get("user_id")
+    new_score = data.get("score")
+    chat_id = data.get("chat_id")
+
+    if not user_id:
+        return jsonify({"error": "missing user_id"}), 400
+    if new_score is None:
+        return jsonify({"error": "missing score"}), 400
+    if not chat_id:
+        return jsonify({"error": "missing chat_id"}), 400
+
+    try:
+        new_score = int(new_score)
+    except (TypeError, ValueError):
+        return jsonify({"error": "score must be an integer"}), 400
+
+    if not (1 <= new_score <= 8):
+        return jsonify({"error": "score must be between 1 and 8"}), 400
+
+    utc_start, utc_end = today_il_utc_range()
+
+    with db() as conn:
+        row = conn.execute(
+            """SELECT id, scan_status FROM plays
+               WHERE user_id = ?
+                 AND chat_id = ?
+                 AND played_at >= ?
+                 AND played_at <  ?
+               ORDER BY played_at DESC
+               LIMIT 1""",
+            (user_id, chat_id,
+             utc_start.strftime("%Y-%m-%d %H:%M:%S"),
+             utc_end.strftime("%Y-%m-%d %H:%M:%S")),
+        ).fetchone()
+
+        if row is None:
+            return jsonify({"error": "no submission found for today from this user"}), 404
+
+        if not row["scan_status"].startswith("failed"):
+            return jsonify({"error": "today's submission did not fail — correction not allowed"}), 409
+
+        conn.execute(
+            "UPDATE plays SET score = ?, scan_status = 'manual' WHERE id = ?",
+            (new_score, row["id"]),
+        )
+
+    return jsonify({"score": new_score, "status": "manual"})
+
+
 @app.get("/leaderboard")
 def leaderboard():
     sid = resolve_sprint(request.args.get("sprint"))
     start, end = sprint_date_range(sid)
+    chat_id = request.args.get("chat_id")
+
+    query = """
+        SELECT user_id,
+               (SELECT user_name FROM plays p2
+                WHERE p2.user_id = p.user_id
+                ORDER BY played_at DESC LIMIT 1) AS user_name,
+               COUNT(*) AS plays,
+               SUM(score) AS total_score
+        FROM plays p
+        WHERE sprint_id = ? AND scan_status IN ('success', 'manual')
+    """
+    params = [sid]
+    if chat_id:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
+    query += " GROUP BY user_id ORDER BY total_score DESC"
 
     with db() as conn:
-        rows = conn.execute("""
-            SELECT user_id,
-                   (SELECT user_name FROM plays p2
-                    WHERE p2.user_id = p.user_id
-                    ORDER BY played_at DESC LIMIT 1) AS user_name,
-                   COUNT(*) AS plays,
-                   SUM(score) AS total_score,
-                   MAX(score) AS best_score
-            FROM plays p
-            WHERE sprint_id = ? AND scan_status = 'success'
-            GROUP BY user_id
-            ORDER BY total_score DESC
-        """, (sid,)).fetchall()
+        rows = conn.execute(query, params).fetchall()
 
     return jsonify({
         "sprint_id": sid,
@@ -217,16 +284,22 @@ def stats():
         return jsonify({"error": "missing user_id"}), 400
 
     sid = resolve_sprint(request.args.get("sprint"))
+    chat_id = request.args.get("chat_id")
+
+    query = """
+        SELECT COUNT(*) AS plays,
+               SUM(CASE WHEN scan_status IN ('success', 'manual') THEN 1 ELSE 0 END) AS scored,
+               SUM(score) AS total_score
+        FROM plays
+        WHERE user_id = ? AND sprint_id = ?
+    """
+    params = [user_id, sid]
+    if chat_id:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
 
     with db() as conn:
-        row = conn.execute("""
-            SELECT COUNT(*) AS plays,
-                   SUM(CASE WHEN scan_status='success' THEN 1 ELSE 0 END) AS scored,
-                   SUM(score) AS total_score,
-                   MAX(score) AS best_score
-            FROM plays
-            WHERE user_id = ? AND sprint_id = ?
-        """, (user_id, sid)).fetchone()
+        row = conn.execute(query, params).fetchone()
 
     return jsonify({
         "user_id": user_id,
@@ -239,25 +312,30 @@ def stats():
 def summary():
     sid = resolve_sprint(request.args.get("sprint"))
     start, end = sprint_date_range(sid)
+    chat_id = request.args.get("chat_id")
+
+    query = """
+        SELECT user_id,
+               (SELECT user_name FROM plays p2
+                WHERE p2.user_id = p.user_id
+                ORDER BY played_at DESC LIMIT 1) AS user_name,
+               COUNT(*) AS plays,
+               SUM(score) AS total_score
+        FROM plays p
+        WHERE sprint_id = ? AND scan_status IN ('success', 'manual')
+    """
+    params = [sid]
+    if chat_id:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
+    query += " GROUP BY user_id ORDER BY total_score DESC"
 
     with db() as conn:
-        rows = conn.execute("""
-            SELECT user_id,
-                   (SELECT user_name FROM plays p2
-                    WHERE p2.user_id = p.user_id
-                    ORDER BY played_at DESC LIMIT 1) AS user_name,
-                   COUNT(*) AS plays,
-                   SUM(score) AS total_score,
-                   MAX(score) AS best_score
-            FROM plays p
-            WHERE sprint_id = ? AND scan_status = 'success'
-            GROUP BY user_id
-            ORDER BY total_score DESC
-        """, (sid,)).fetchall()
+        rows = conn.execute(query, params).fetchall()
 
     lines = [f"Sprint {sid} Summary ({start} - {end}):"]
     for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. {r['user_name']} - {r['total_score']} pts ({r['plays']} plays, best: {r['best_score']})")
+        lines.append(f"{i}. {r['user_name']} - {r['total_score']} pts ({r['plays']} plays)")
 
     return jsonify({
         "sprint_id": sid,
@@ -313,9 +391,18 @@ def missing():
     """Return members who haven't submitted a screenshot today (Israel time)."""
     utc_start, utc_end = today_il_utc_range()
     date_il = today_il().isoformat()
+    chat_id = request.args.get("chat_id")
+
+    chat_filter = " AND p.chat_id = ?" if chat_id else ""
+    params = [
+        utc_start.strftime("%Y-%m-%d %H:%M:%S"),
+        utc_end.strftime("%Y-%m-%d %H:%M:%S"),
+    ]
+    if chat_id:
+        params.append(chat_id)
 
     with db() as conn:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT m.user_id, m.user_name
             FROM members m
             WHERE NOT EXISTS (
@@ -323,12 +410,10 @@ def missing():
                 WHERE p.user_id = m.user_id
                   AND p.played_at >= ?
                   AND p.played_at <  ?
+                  {chat_filter}
             )
             ORDER BY m.user_name
-        """, (
-            utc_start.strftime("%Y-%m-%d %H:%M:%S"),
-            utc_end.strftime("%Y-%m-%d %H:%M:%S"),
-        )).fetchall()
+        """, params).fetchall()
 
     return jsonify({
         "date": date_il,
