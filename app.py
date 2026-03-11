@@ -393,27 +393,40 @@ def missing():
     date_il = today_il().isoformat()
     chat_id = request.args.get("chat_id")
 
-    chat_filter = " AND p.chat_id = ?" if chat_id else ""
-    params = [
-        utc_start.strftime("%Y-%m-%d %H:%M:%S"),
-        utc_end.strftime("%Y-%m-%d %H:%M:%S"),
-    ]
-    if chat_id:
-        params.append(chat_id)
+    utc_start_s = utc_start.strftime("%Y-%m-%d %H:%M:%S")
+    utc_end_s = utc_end.strftime("%Y-%m-%d %H:%M:%S")
 
     with db() as conn:
-        rows = conn.execute(f"""
-            SELECT m.user_id, m.user_name
-            FROM members m
-            WHERE NOT EXISTS (
-                SELECT 1 FROM plays p
-                WHERE p.user_id = m.user_id
-                  AND p.played_at >= ?
-                  AND p.played_at <  ?
-                  {chat_filter}
-            )
-            ORDER BY m.user_name
-        """, params).fetchall()
+        if chat_id:
+            # Members of this group = anyone who has ever played in it
+            rows = conn.execute("""
+                SELECT DISTINCT p.user_id,
+                       (SELECT user_name FROM plays p2
+                        WHERE p2.user_id = p.user_id AND p2.chat_id = ?
+                        ORDER BY played_at DESC LIMIT 1) AS user_name
+                FROM plays p
+                WHERE p.chat_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM plays p3
+                      WHERE p3.user_id = p.user_id
+                        AND p3.chat_id = ?
+                        AND p3.played_at >= ?
+                        AND p3.played_at <  ?
+                  )
+                ORDER BY user_name
+            """, (chat_id, chat_id, chat_id, utc_start_s, utc_end_s)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT m.user_id, m.user_name
+                FROM members m
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM plays p
+                    WHERE p.user_id = m.user_id
+                      AND p.played_at >= ?
+                      AND p.played_at <  ?
+                )
+                ORDER BY m.user_name
+            """, (utc_start_s, utc_end_s)).fetchall()
 
     return jsonify({
         "date": date_il,
