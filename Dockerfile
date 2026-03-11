@@ -8,12 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install only what the service needs (no playwright, no tesseract)
-RUN pip install --no-cache-dir \
-    flask \
-    opencv-python \
-    numpy \
-    psutil
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY scorer.py app.py ./
 
@@ -21,4 +17,4 @@ RUN mkdir -p /data
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "app:app"]
