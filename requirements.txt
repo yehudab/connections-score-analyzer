@@ -12,7 +12,6 @@ packaging==25.0
 pillow==12.0.0
 playwright==1.57.0
 openai>=1.0.0
-websockets>=13.0
 psutil==7.2.2
 pyee==13.0.0
 pytesseract==0.3.13

@@ -18,7 +18,7 @@ Pipeline:
 Usage:
     python connections_solver.py [--cdp-url ws://127.0.0.1:9222] [--output win.png]
 
-    # Use Playwright's bundled Chromium (required for NYT — Lightpanda crashes on React):
+    # Use Playwright's bundled Chromium instead of Lightpanda:
     python connections_solver.py --no-cdp --headed
 
     # Verbose LLM logging + debug screenshots:
@@ -42,7 +42,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import websockets
 from openai import OpenAI
 from playwright.async_api import async_playwright
 
@@ -553,151 +552,6 @@ async def play_game(page, tiles: list[str], model: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Lightpanda CDP proxy
-#
-# Playwright's connect_over_cdp sends Target.setAutoAttach{flatten:true} during
-# init which kills Lightpanda's page target.  This proxy:
-#   1. Pre-creates a Lightpanda session (createTarget + attachToTarget{flatten:true})
-#      via raw WebSocket before Playwright ever connects.
-#   2. Intercepts Playwright's three init commands and responds synthetically.
-#   3. Forwards everything else (including flat session messages) directly —
-#      Lightpanda supports flatten=True so no wrapping is needed.
-# ---------------------------------------------------------------------------
-
-
-class LightpandaProxy:
-    """WebSocket proxy that makes Playwright work with Lightpanda.
-
-    Lightpanda supports flatten=True (flat session mode), so session messages
-    are exchanged with sessionId at the top level — no wrapping needed.
-    The proxy only needs to intercept Playwright's three init commands so it
-    doesn't try to discover/attach targets itself (which would kill the page).
-    """
-
-    def __init__(self, lightpanda_url: str = "ws://localhost:9222", proxy_port: int = 9221):
-        self.lightpanda_url = lightpanda_url
-        self.proxy_port = proxy_port
-        self.url = f"ws://localhost:{proxy_port}"
-        self._target_id: str | None = None
-        self._session_id: str | None = None
-        self._server = None
-        self._lp_ws = None
-        self._next_id = 1
-
-    async def _lp_cmd(self, method: str, params: dict | None = None) -> dict:
-        """Send a command to Lightpanda, skip unsolicited events, return response."""
-        msg_id = self._next_id
-        self._next_id += 1
-        await self._lp_ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
-        while True:
-            raw = await self._lp_ws.recv()
-            data = json.loads(raw)
-            if data.get("id") == msg_id:
-                if "error" in data:
-                    raise RuntimeError(f"Lightpanda error for {method}: {data['error']}")
-                return data
-            # Unsolicited event (e.g. Target.targetCreated) — discard during setup
-
-    async def start(self) -> None:
-        print(f"  [proxy] Connecting raw WebSocket to {self.lightpanda_url} ...")
-        self._lp_ws = await websockets.connect(
-            self.lightpanda_url,
-            additional_headers={"Host": "localhost"},
-        )
-
-        resp = await self._lp_cmd("Target.createTarget", {"url": "about:blank"})
-        self._target_id = resp["result"]["targetId"]
-
-        # flatten=True: Lightpanda supports flat session messages (sessionId at top level)
-        resp = await self._lp_cmd("Target.attachToTarget", {"targetId": self._target_id, "flatten": True})
-        self._session_id = resp["result"]["sessionId"]
-
-        print(f"  [proxy] target={self._target_id}  session={self._session_id}")
-
-        self._server = await websockets.serve(self._handle_client, "localhost", self.proxy_port)
-        print(f"  [proxy] Proxy listening on {self.url}")
-
-    async def stop(self) -> None:
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-        if self._lp_ws:
-            await self._lp_ws.close()
-
-    def _target_info(self, attached: bool) -> dict:
-        return {
-            "targetId": self._target_id,
-            "type": "page",
-            "title": "",
-            "url": "about:blank",
-            "attached": attached,
-            "canAccessOpener": False,
-            "browserContextId": "BID-1",
-        }
-
-    async def _handle_client(self, pw_ws) -> None:
-        """Handle one Playwright WebSocket connection (flat session mode)."""
-
-        async def from_pw() -> None:
-            async for raw in pw_ws:
-                data = json.loads(raw)
-                method = data.get("method", "")
-                msg_id = data.get("id")
-                sid = data.get("sessionId")  # present when called at session level
-
-                def _reply(result: dict) -> str:
-                    msg: dict = {"id": msg_id, "result": result}
-                    if sid:
-                        msg["sessionId"] = sid
-                    return json.dumps(msg)
-
-                def _event(evt_method: str, params: dict) -> str:
-                    msg: dict = {"method": evt_method, "params": params}
-                    if sid:
-                        msg["sessionId"] = sid
-                    return json.dumps(msg)
-
-                if method == "Target.setDiscoverTargets":
-                    # Only send synthetic targetCreated at the browser level
-                    await pw_ws.send(_reply({}))
-                    if not sid:
-                        await pw_ws.send(_event("Target.targetCreated", {
-                            "targetInfo": self._target_info(False),
-                        }))
-
-                elif method == "Target.setAutoAttach":
-                    await pw_ws.send(_reply({}))
-                    # Only attach at the browser level; session-level calls get empty OK
-                    if not sid:
-                        await pw_ws.send(_event("Target.attachedToTarget", {
-                            "sessionId": self._session_id,
-                            "targetInfo": self._target_info(True),
-                            "waitingForDebugger": False,
-                        }))
-
-                elif method == "Target.getTargets":
-                    await pw_ws.send(_reply({"targetInfos": [self._target_info(True)]}))
-
-                else:
-                    # Everything else (including flat session messages) → Lightpanda
-                    await self._lp_ws.send(raw)
-
-        async def from_lp() -> None:
-            async for raw in self._lp_ws:
-                data = json.loads(raw)
-                method = data.get("method", "")
-                # Filter Lightpanda's own copies of events we already sent synthetically
-                if method in ("Target.targetCreated", "Target.attachedToTarget"):
-                    continue
-                await pw_ws.send(raw)
-
-        tasks = [asyncio.ensure_future(from_pw()), asyncio.ensure_future(from_lp())]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -717,28 +571,11 @@ async def run(args: argparse.Namespace) -> None:
             page = await context.new_page()
         else:
             cdp_url = args.cdp_url or DEFAULT_CDP_URL
-            print(f"Starting Lightpanda proxy for {cdp_url} ...")
-            proxy = LightpandaProxy(lightpanda_url=cdp_url, proxy_port=9221)
-            await proxy.start()
+            print(f"Connecting Playwright directly to {cdp_url} ...")
+            browser = await pw.chromium.connect_over_cdp(cdp_url)
 
-            print(f"Connecting Playwright to proxy at {proxy.url} ...")
-            browser = await pw.chromium.connect_over_cdp(proxy.url)
-
-            # The proxy pre-created one page for us — grab it from Playwright's view.
-            page = None
-            for ctx in browser.contexts:
-                if ctx.pages:
-                    page = ctx.pages[0]
-                    break
-            if page is None:
-                try:
-                    ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-                    page = await ctx.new_page()
-                except Exception as e:
-                    await proxy.stop()
-                    raise RuntimeError(
-                        f"Could not get a page from the proxy session: {e}"
-                    ) from e
+            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
         try:
             print(f"Navigating to {NYT_CONNECTIONS_URL} ...")
@@ -747,10 +584,8 @@ async def run(args: argparse.Namespace) -> None:
             except Exception as e:
                 if "TargetClosedError" in type(e).__name__ or "TargetClosedError" in str(e):
                     raise RuntimeError(
-                        "The browser target closed during navigation.\n"
-                        "If you are using Lightpanda: it does not yet support React SPAs like NYT Connections "
-                        "(exits 139 / SIGSEGV while executing the React bundle).\n"
-                        "Run with --no-cdp to use Playwright's bundled Chromium instead."
+                        "The browser target closed during navigation. "
+                        "Try --no-cdp to use Playwright's bundled Chromium instead."
                     ) from e
                 raise
 
@@ -791,8 +626,6 @@ async def run(args: argparse.Namespace) -> None:
 
         finally:
             await browser.close()
-            if not args.no_cdp:
-                await proxy.stop()
 
 
 def main() -> None:
