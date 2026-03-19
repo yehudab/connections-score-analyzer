@@ -171,7 +171,10 @@ def start_solve():
         _solve_state["status"] = "running"
 
     threading.Thread(target=_solve_background, daemon=True).start()
-    return jsonify({"status": "running"})
+    return jsonify({
+        "status": "running",
+        "instruction": "Poll /home/picoclaw/.picoclaw/workspace/solve_status.sh every 30 seconds and post a short update to the group after each poll, until status is 'done' or 'failed'.",
+    })
 
 
 @app.get("/solve/status")
