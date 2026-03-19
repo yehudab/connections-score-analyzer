@@ -70,7 +70,11 @@ _load_env_file()
 
 NYT_CONNECTIONS_URL = "https://www.nytimes.com/games/connections"
 DEFAULT_CDP_URL = "ws://localhost:9222"
+LIGHTPANDA_CLOUD_URL = "wss://euwest.cloud.lightpanda.io/ws?browser=chrome"
 DEFAULT_MODEL = "google/gemini-2.5-pro"
+
+SOLVER_DEBUG_DIR = Path(__file__).parent / "solver-debug"
+SOLVER_IMAGES_DIR = Path(__file__).parent / "solver-images"
 
 TILE_SELECTORS = [
     '[data-testid="card-label"]',
@@ -107,11 +111,11 @@ def log_llm(label: str, text: str) -> None:
 
     if DEBUG:
         global _llm_call_index
+        SOLVER_DEBUG_DIR.mkdir(exist_ok=True)
         ts = datetime.now().strftime("%H%M%S")
-        fname = f"debug_llm_{ts}_{_llm_call_index:02d}_{label.replace(' ', '_')}.txt"
+        fname = SOLVER_DEBUG_DIR / f"llm_{ts}_{_llm_call_index:02d}_{label.replace(' ', '_')}.txt"
         _llm_call_index += 1
-        with open(fname, "w") as f:
-            f.write(text)
+        fname.write_text(text)
         print(f"  (saved to {fname})", file=sys.stderr)
 
 
@@ -123,10 +127,12 @@ def log_llm(label: str, text: str) -> None:
 async def dismiss_overlays(page) -> None:
     candidates = [
         'button[data-testid="GDPR-accept"]',
+        '#fides-accept-all-button',
         '#games-fullscreen-modal button[class*="close"]',
         'button[aria-label="Close"]',
         'button:text("Got it")',
         'button:text("Accept")',
+        'button:text("Accept All")',
         'button:text("Play")',
         'button:text("Play!")',
     ]
@@ -138,6 +144,8 @@ async def dismiss_overlays(page) -> None:
                 await page.wait_for_timeout(600)
         except Exception:
             pass
+    # Force-remove any lingering Fides overlay that blocks clicks
+    await page.evaluate("document.getElementById('fides-overlay')?.remove()")
 
 
 # ---------------------------------------------------------------------------
@@ -442,9 +450,11 @@ async def submit_group(page, members: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def play_game(page, tiles: list[str], model: str) -> bool:
+async def play_game(page, tiles: list[str], model: str) -> tuple[bool, int, list[dict]]:
     """
-    Play the game iteratively. Returns True on a full solve.
+    Play the game iteratively.
+    Returns (success, mistakes, solved_groups) where solved_groups is a list of
+    {"theme": ..., "members": [...]} dicts for each correctly guessed group.
 
     Retry strategy:
     - "One Away": apply the LLM's pre-computed alternative swap (no extra
@@ -455,6 +465,7 @@ async def play_game(page, tiles: list[str], model: str) -> bool:
     remaining: list[str] = list(tiles)
     mistakes = 0
     groups_solved = 0
+    solved_groups: list[dict] = []
     failed_guesses: list[dict] = []
     tried_sets: set[frozenset] = set()   # Python-enforced dedup — LLM can't be trusted
 
@@ -494,6 +505,7 @@ async def play_game(page, tiles: list[str], model: str) -> bool:
             for w in members:
                 remaining.remove(w)
             groups_solved += 1
+            solved_groups.append({"theme": group["theme"], "members": members})
             groups = [
                 g for g in groups
                 if all(m in remaining for m in g["members"])
@@ -548,7 +560,7 @@ async def play_game(page, tiles: list[str], model: str) -> bool:
         print(f"\nSolved! ({mistakes} mistake(s))")
     else:
         print(f"\nGame over — {mistakes} mistakes, solved {groups_solved}/4 groups.")
-    return success
+    return success, mistakes, solved_groups
 
 
 # ---------------------------------------------------------------------------
@@ -556,24 +568,46 @@ async def play_game(page, tiles: list[str], model: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def run(args: argparse.Namespace) -> None:
+async def solve(
+    *,
+    cloud: bool = False,
+    no_cdp: bool = False,
+    headed: bool = False,
+    cdp_url: str | None = None,
+    debug: bool = False,
+) -> dict:
+    """
+    Run the solver and return a result dict with keys:
+      success, groups, mistakes, elapsed_seconds, model, image_path
+    """
     import time
+    global DEBUG
+    DEBUG = debug
+
     start_time = time.monotonic()
     model = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
     print(f"Model: {model}")
 
     async with async_playwright() as pw:
-        if args.no_cdp:
-            headless = not args.headed
-            print(f"Launching Playwright Chromium ({'headed' if args.headed else 'headless'}) ...")
+        if no_cdp:
+            headless = not headed
+            print(f"Launching Playwright Chromium ({'headed' if headed else 'headless'}) ...")
             browser = await pw.chromium.launch(headless=headless)
             context = await browser.new_context(viewport={"width": 1280, "height": 900})
             page = await context.new_page()
+        elif cloud:
+            token = os.environ.get("LIGHTPANDA_TOKEN")
+            if not token:
+                raise RuntimeError("LIGHTPANDA_TOKEN is not set.")
+            url = f"{LIGHTPANDA_CLOUD_URL}&token={token}"
+            print("Connecting to Lightpanda Cloud ...")
+            browser = await pw.chromium.connect_over_cdp(url)
+            context = await browser.new_context()
+            page = await context.new_page()
         else:
-            cdp_url = args.cdp_url or DEFAULT_CDP_URL
-            print(f"Connecting Playwright directly to {cdp_url} ...")
-            browser = await pw.chromium.connect_over_cdp(cdp_url)
-
+            url = cdp_url or DEFAULT_CDP_URL
+            print(f"Connecting Playwright directly to {url} ...")
+            browser = await pw.chromium.connect_over_cdp(url)
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
@@ -599,33 +633,56 @@ async def run(args: argparse.Namespace) -> None:
             print("  Clicked Play")
             await page.wait_for_timeout(1000)
 
-            if args.debug:
-                await page.screenshot(path="debug_loaded.png")
-                print("  Saved: debug_loaded.png")
+            if debug:
+                SOLVER_DEBUG_DIR.mkdir(exist_ok=True)
+                debug_path = str(SOLVER_DEBUG_DIR / "loaded.png")
+                await page.screenshot(path=debug_path)
+                print(f"  Saved: {debug_path}")
 
             print("Extracting tiles ...")
             tiles = await extract_tiles(page)
 
             if len(tiles) != 16:
-                await page.screenshot(path="debug_no_tiles.png")
-                print(
-                    f"Expected 16 tiles, got {len(tiles)}: {tiles}",
-                    file=sys.stderr,
-                )
+                SOLVER_DEBUG_DIR.mkdir(exist_ok=True)
+                err_path = str(SOLVER_DEBUG_DIR / "no_tiles.png")
+                await page.screenshot(path=err_path)
+                msg = f"Expected 16 tiles, got {len(tiles)}: {tiles}"
+                print(msg, file=sys.stderr)
                 if not tiles:
-                    sys.exit(1)
+                    raise RuntimeError(msg)
 
             print(f"Tiles: {tiles}\n")
 
-            await play_game(page, tiles, model)
+            success, mistakes, solved_groups = await play_game(page, tiles, model)
 
             elapsed = time.monotonic() - start_time
-            print(f"\nSaving screenshot → {args.output}")
-            await page.screenshot(path=args.output, full_page=False)
-            print(f"Done!  {args.output}  (total time: {elapsed:.1f}s)")
+            SOLVER_IMAGES_DIR.mkdir(exist_ok=True)
+            image_path = str(SOLVER_IMAGES_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.png")
+            await page.screenshot(path=image_path, full_page=False)
+            print(f"Done!  {image_path}  (total time: {elapsed:.1f}s)")
+
+            return {
+                "success": success,
+                "groups": solved_groups,
+                "mistakes": mistakes,
+                "elapsed_seconds": round(elapsed, 1),
+                "model": model,
+                "image_path": image_path,
+            }
 
         finally:
             await browser.close()
+
+
+async def run(args: argparse.Namespace) -> None:
+    result = await solve(
+        cloud=args.cloud,
+        no_cdp=args.no_cdp,
+        headed=args.headed,
+        cdp_url=args.cdp_url,
+        debug=args.debug,
+    )
+    print(json.dumps(result, indent=2))
 
 
 def main() -> None:
@@ -645,15 +702,14 @@ def main() -> None:
         help="Use Playwright's bundled Chromium instead of a CDP server",
     )
     parser.add_argument(
+        "--cloud",
+        action="store_true",
+        help="Use Lightpanda Cloud (Chrome); requires LIGHTPANDA_TOKEN env var",
+    )
+    parser.add_argument(
         "--headed",
         action="store_true",
         help="Run Chromium in headed (visible) mode; only applies with --no-cdp",
-    )
-    parser.add_argument(
-        "--output",
-        default="connections_win.png",
-        metavar="FILE",
-        help="Output screenshot path (default: connections_win.png)",
     )
     parser.add_argument(
         "--debug",

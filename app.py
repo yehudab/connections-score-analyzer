@@ -10,9 +10,12 @@ from datetime import date, datetime, timedelta, timezone
 from contextlib import contextmanager
 from zoneinfo import ZoneInfo
 
+import asyncio
+
 from flask import Flask, request, jsonify
 
 from scorer import compute_score_from_bar_image
+from connections_solver import solve as run_solver
 
 app = Flask(__name__)
 
@@ -132,6 +135,12 @@ def resolve_sprint(sprint_param):
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.post("/solve")
+def solve():
+    result = asyncio.run(run_solver(cloud=True))
+    return jsonify(result)
 
 
 @app.get("/sprint")

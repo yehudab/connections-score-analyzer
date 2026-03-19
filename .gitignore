@@ -1,6 +1,8 @@
 # Downloaded images and debug output
 images/
 images-debug/
+solver-debug/
+solver-images/
 
 # WhatsApp browser session data
 whatsapp-session/
