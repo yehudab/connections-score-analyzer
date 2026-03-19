@@ -173,7 +173,7 @@ def start_solve():
     threading.Thread(target=_solve_background, daemon=True).start()
     return jsonify({
         "status": "running",
-        "instruction": "Poll /home/picoclaw/.picoclaw/workspace/solve_status.sh every 30 seconds and post a short update to the group after each poll, until status is 'done' or 'failed'.",
+        "instruction": "Start a cron job that runs /home/picoclaw/.picoclaw/workspace/solve_poll.sh every 30 seconds. Each run outputs a CRON_ACTION line: follow 'continue' by posting a short update; follow 'stop' by deleting the cron job and posting the final result.",
     })
 
 
