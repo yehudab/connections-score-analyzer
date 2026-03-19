@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY scorer.py app.py connections_solver.py ./
 
-RUN mkdir -p /data
+RUN mkdir -p /data /app/solver-images
 
 EXPOSE 5000
 
