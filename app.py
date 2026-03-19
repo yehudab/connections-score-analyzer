@@ -11,8 +11,10 @@ from contextlib import contextmanager
 from zoneinfo import ZoneInfo
 
 import asyncio
+import threading
+import time
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 
 from scorer import compute_score_from_bar_image
 from connections_solver import solve as run_solver
@@ -20,6 +22,7 @@ from connections_solver import solve as run_solver
 app = Flask(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "/data/scores.db")
+PUBLIC_SOLVER_URL = os.environ.get("PUBLIC_SOLVER_URL", "").rstrip("/")
 SPRINT_EPOCH_DEFAULT = "2026-02-06"
 IL_TZ = ZoneInfo("Asia/Jerusalem")
 
@@ -137,10 +140,53 @@ def health():
     return jsonify({"status": "ok"})
 
 
+_solve_state: dict = {"status": "idle"}
+_solve_lock = threading.Lock()
+
+
+def _solve_background():
+    start = time.monotonic()
+    try:
+        result = asyncio.run(run_solver(cloud=True))
+        if PUBLIC_SOLVER_URL and result.get("image_path"):
+            filename = os.path.basename(result["image_path"])
+            result["image_url"] = f"{PUBLIC_SOLVER_URL}/solver-images/{filename}"
+        with _solve_lock:
+            _solve_state.update({"status": "done", **result})
+    except Exception as e:
+        with _solve_lock:
+            _solve_state.update({
+                "status": "failed",
+                "error": str(e),
+                "elapsed_seconds": round(time.monotonic() - start, 1),
+            })
+
+
 @app.post("/solve")
-def solve():
-    result = asyncio.run(run_solver(cloud=True))
-    return jsonify(result)
+def start_solve():
+    with _solve_lock:
+        if _solve_state.get("status") == "running":
+            return jsonify({"status": "running", "message": "Already in progress"}), 409
+        _solve_state.clear()
+        _solve_state["status"] = "running"
+
+    threading.Thread(target=_solve_background, daemon=True).start()
+    return jsonify({"status": "running"})
+
+
+@app.get("/solve/status")
+def solve_status():
+    with _solve_lock:
+        return jsonify(dict(_solve_state))
+
+
+@app.get("/solve/image")
+def solve_image():
+    with _solve_lock:
+        image_path = _solve_state.get("image_path")
+    if not image_path:
+        return jsonify({"error": "no image available"}), 404
+    return send_file(image_path, mimetype="image/png")
 
 
 @app.get("/sprint")
