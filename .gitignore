@@ -17,3 +17,9 @@ __pycache__/
 
 # Claude
 .claude/
+
+# Secrets
+.env
+
+# Test DB
+dev.db

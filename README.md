@@ -119,23 +119,82 @@ Both containers share a Docker network (`botnet`). The bot reaches the scorer at
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/score` | Submit image for scoring. Fields: `image` (file), `user_id`, `user_name` |
-| `GET` | `/leaderboard?sprint=current` | Rankings for a sprint |
-| `GET` | `/stats?user_id=X&sprint=current` | Personal stats |
-| `GET` | `/summary?sprint=current` | Formatted sprint summary text |
-| `GET` | `/missing` | Members who haven't submitted today (Israel time) |
+| `POST` | `/score` | Submit image for scoring. Fields: `image` (file), `user_id`, `user_name`, `chat_id` |
+| `POST` | `/score/correct` | Manually correct a failed submission. Body: `{user_id, score, chat_id}` |
+| `GET` | `/leaderboard?sprint=current\|previous\|<n>&chat_id=X` | Rankings for a sprint |
+| `GET` | `/stats?user_id=X&sprint=current\|previous\|<n>&chat_id=X` | Personal stats |
+| `GET` | `/summary?sprint=current\|previous\|<n>&chat_id=X` | Formatted sprint summary |
+| `GET` | `/sprint/end_report?chat_id=X` | Previous sprint results; `should_post` true only on sprint transition day |
+| `GET` | `/missing?chat_id=X` | Members who haven't submitted today (Israel time) |
 | `GET` | `/sprint` | Current sprint ID, dates, days remaining |
-| `GET` | `/config/sprint_epoch` | View sprint start date |
-| `PUT` | `/config/sprint_epoch` | Update sprint start date |
+| `GET` | `/config/sprint_epoch` | View sprint epoch date |
+| `PUT` | `/config/sprint_epoch` | Update sprint epoch. Body: `{"date": "YYYY-MM-DD"}` |
 | `GET` | `/health` | Health check |
 
-### Curling the API
+### Local Development
+
+```bash
+# First time
+python3 -m venv .venv
+pip install -r requirements.txt
+
+# Every time
+source .venv/bin/activate
+set -a && source .env && set +a   # export vars from .env (copy from .env.example)
+
+# Init DB and start server (use a local DB path)
+DB_PATH=./dev.db python app.py
+```
+
+Test with a fake group ID (WhatsApp format required for chat_id validation):
+
+```bash
+CHAT="120363000000000001@g.us"
+
+# Submit a screenshot
+curl -X POST http://localhost:5000/score \
+  -F "image=@/path/to/screenshot.jpg" \
+  -F "user_id=972501234567@s.whatsapp.net" \
+  -F "user_name=Alice" \
+  -F "chat_id=$CHAT"
+
+# Manually correct a failed scan
+curl -X POST http://localhost:5000/score/correct \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"972501234567@s.whatsapp.net","score":5,"chat_id":"'"$CHAT"'"}'
+
+# Leaderboard (current / previous sprint)
+curl -sG "http://localhost:5000/leaderboard?sprint=current" --data-urlencode "chat_id=$CHAT"
+curl -sG "http://localhost:5000/leaderboard?sprint=previous" --data-urlencode "chat_id=$CHAT"
+
+# Personal stats
+curl -sG "http://localhost:5000/stats?sprint=current" \
+  --data-urlencode "user_id=972501234567@s.whatsapp.net" \
+  --data-urlencode "chat_id=$CHAT"
+
+# Sprint summary
+curl -sG "http://localhost:5000/summary?sprint=current" --data-urlencode "chat_id=$CHAT"
+curl -sG "http://localhost:5000/summary?sprint=previous" --data-urlencode "chat_id=$CHAT"
+
+# Sprint end report (returns should_post=true only on sprint transition days)
+curl -sG "http://localhost:5000/sprint/end_report" --data-urlencode "chat_id=$CHAT"
+
+# Who hasn't submitted today?
+curl -sG "http://localhost:5000/missing" --data-urlencode "chat_id=$CHAT"
+
+# Sprint info
+curl -s http://localhost:5000/sprint
+```
+
+### Curling the API (Production)
 
 Use the picoclaw-gateway container (which has `curl`) to call the scorer.
 This also verifies the Docker network between the two containers is working:
 
 ```bash
 sudo docker exec -it picoclaw-gateway sh
+
+CHAT="120363xxxxxxxxxxxxxxxxx@g.us"
 
 # Health check
 curl http://scorer:5000/health
@@ -144,24 +203,26 @@ curl http://scorer:5000/health
 curl http://scorer:5000/sprint
 
 # Who hasn't submitted today?
-curl http://scorer:5000/missing
+curl -sG "http://scorer:5000/missing" --data-urlencode "chat_id=$CHAT"
 
-# Leaderboard
-curl http://scorer:5000/leaderboard?sprint=current
+# Leaderboard / summary
+curl -sG "http://scorer:5000/leaderboard?sprint=current" --data-urlencode "chat_id=$CHAT"
+curl -sG "http://scorer:5000/summary?sprint=previous" --data-urlencode "chat_id=$CHAT"
 
-# Sprint summary
-curl http://scorer:5000/summary?sprint=current
+# Sprint end report
+curl -sG "http://scorer:5000/sprint/end_report" --data-urlencode "chat_id=$CHAT"
 
 # Update sprint epoch
 curl -X PUT http://scorer:5000/config/sprint_epoch \
   -H "Content-Type: application/json" \
-  -d '{"date": "2025-12-12"}'
+  -d '{"date": "2026-02-06"}'
 
-# Score an image manually (image must exist inside the picoclaw-gateway container)
+# Score an image manually (image must be inside the picoclaw-gateway container)
 curl -X POST http://scorer:5000/score \
   -F "image=@/home/picoclaw/.picoclaw/workspace/media/some-image.jpg" \
-  -F "user_id=972500000000" \
-  -F "user_name=Alice"
+  -F "user_id=972501234567@s.whatsapp.net" \
+  -F "user_name=Alice" \
+  -F "chat_id=$CHAT"
 ```
 
 ### Sprint Configuration

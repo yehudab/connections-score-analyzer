@@ -128,6 +128,8 @@ def sprint_date_range(sprint_id):
 def resolve_sprint(sprint_param):
     if sprint_param is None or sprint_param == "current":
         return current_sprint_id()
+    if sprint_param == "previous":
+        return max(0, current_sprint_id() - 1)
     return int(sprint_param)
 
 
@@ -201,6 +203,55 @@ def sprint_info():
         "start": start.isoformat(),
         "end": end.isoformat(),
         "days_remaining": (end - today_il()).days + 1,
+    })
+
+
+@app.get("/sprint/end_report")
+def sprint_end_report():
+    """
+    Returns the just-finished sprint's summary.
+    should_post=true only on the first day of a new sprint (i.e. the sprint
+    actually just rolled over), so a daily cron can call this and skip silently
+    on non-transition days.
+    """
+    chat_id = request.args.get("chat_id")
+    today = today_il()
+    epoch = get_sprint_epoch()
+
+    # First day of a new sprint: days_since_epoch divisible by 14
+    is_transition_day = (today - epoch).days % 14 == 0
+    finished_sprint_id = current_sprint_id() - 1
+
+    if not is_transition_day or finished_sprint_id < 0:
+        return jsonify({"should_post": False, "reason": "not a sprint transition day"})
+
+    start, end = sprint_date_range(finished_sprint_id)
+
+    query = """
+        SELECT user_id,
+               (SELECT user_name FROM plays p2
+                WHERE p2.user_id = p.user_id
+                ORDER BY played_at DESC LIMIT 1) AS user_name,
+               COUNT(*) AS plays,
+               SUM(score) AS total_score
+        FROM plays p
+        WHERE sprint_id = ? AND scan_status IN ('success', 'manual')
+    """
+    params = [finished_sprint_id]
+    if chat_id:
+        query += " AND chat_id = ?"
+        params.append(chat_id)
+    query += " GROUP BY user_id ORDER BY total_score DESC"
+
+    with db() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    return jsonify({
+        "should_post": True,
+        "sprint_id": finished_sprint_id,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "rankings": [dict(r) for r in rows],
     })
 
 
