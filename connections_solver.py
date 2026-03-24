@@ -200,8 +200,7 @@ _GROUP_SCHEMA_EXAMPLE = """{
 def _llm_client() -> OpenAI:
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("Error: OPENROUTER_API_KEY is not set.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("OPENROUTER_API_KEY is not set")
     return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
 
@@ -290,10 +289,18 @@ Required JSON format:
 
     log_llm("PROMPT", prompt)
 
+    print(f"[llm] calling model={model} tiles={len(tiles)} ...", file=sys.stderr, flush=True)
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=16000,
+    )
+    usage = response.usage
+    print(
+        f"[llm] response received id={response.id}"
+        f" prompt_tokens={usage.prompt_tokens if usage else '?'}"
+        f" completion_tokens={usage.completion_tokens if usage else '?'}",
+        file=sys.stderr, flush=True,
     )
 
     raw = response.choices[0].message.content
@@ -721,7 +728,7 @@ def main() -> None:
 
     if not os.environ.get("OPENROUTER_API_KEY"):
         print("Error: OPENROUTER_API_KEY is not set.", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(1)  # intentional: CLI entry point, not called from the web server
 
     asyncio.run(run(args))
 

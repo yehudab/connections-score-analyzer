@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import asyncio
 import threading
 import time
+import traceback
 
 from flask import Flask, request, jsonify, send_file
 
@@ -148,19 +149,26 @@ _solve_lock = threading.Lock()
 
 def _solve_background():
     start = time.monotonic()
+    print(f"[solver] started at {datetime.now(timezone.utc).isoformat()}", flush=True)
     try:
         result = asyncio.run(run_solver(cloud=True))
         if PUBLIC_SOLVER_URL and result.get("image_path"):
             filename = os.path.basename(result["image_path"])
             result["image_url"] = f"{PUBLIC_SOLVER_URL}/solver-images/{filename}"
+        elapsed = round(time.monotonic() - start, 1)
+        print(f"[solver] done in {elapsed}s — success={result.get('success')} mistakes={result.get('mistakes')}", flush=True)
         with _solve_lock:
             _solve_state.update({"status": "done", **result})
-    except Exception as e:
+    except BaseException as e:
+        elapsed = round(time.monotonic() - start, 1)
+        tb = traceback.format_exc()
+        print(f"[solver] FAILED after {elapsed}s: {e}\n{tb}", flush=True)
         with _solve_lock:
             _solve_state.update({
                 "status": "failed",
                 "error": str(e),
-                "elapsed_seconds": round(time.monotonic() - start, 1),
+                "traceback": tb,
+                "elapsed_seconds": elapsed,
             })
 
 
@@ -544,6 +552,21 @@ def missing():
     })
 
 
+def _log_startup_config():
+    model = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-pro (default)")
+    has_or_key = bool(os.environ.get("OPENROUTER_API_KEY"))
+    has_lp_token = bool(os.environ.get("LIGHTPANDA_TOKEN"))
+    print(
+        f"[scorer] startup — model={model}"
+        f" OPENROUTER_API_KEY={'set' if has_or_key else 'MISSING'}"
+        f" LIGHTPANDA_TOKEN={'set' if has_lp_token else 'MISSING'}",
+        flush=True,
+    )
+
+
+_log_startup_config()
+init_db()
+
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=5000)
