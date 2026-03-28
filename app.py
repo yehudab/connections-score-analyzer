@@ -285,8 +285,42 @@ def score():
         os.unlink(tmp_path)
 
     sprint_id = current_sprint_id()
+    utc_start, utc_end = today_il_utc_range()
 
     with db() as conn:
+        # Check if user already has a valid submission today in this chat
+        existing_query = """SELECT id FROM plays
+               WHERE user_id = ?
+                 AND played_at >= ?
+                 AND played_at <  ?
+                 AND scan_status IN ('success', 'manual')"""
+        existing_params = [user_id,
+                           utc_start.strftime("%Y-%m-%d %H:%M:%S"),
+                           utc_end.strftime("%Y-%m-%d %H:%M:%S")]
+        if chat_id:
+            existing_query += " AND chat_id = ?"
+            existing_params.append(chat_id)
+        existing_query += " LIMIT 1"
+        existing = conn.execute(existing_query, existing_params).fetchone()
+
+        if existing is not None:
+            # Not a game image — don't penalise, don't record
+            if status == "failed:not_a_game":
+                return jsonify({"score": None, "status": status, "user_name": user_name, "sprint_id": sprint_id}), 422
+            # Any other result (success or parse failure) → duplicate_submission
+            conn.execute(
+                """INSERT INTO plays (user_id, user_name, chat_id, score, scan_status, sprint_id)
+                   VALUES (?, ?, ?, NULL, 'duplicate_submission', ?)""",
+                (user_id, user_name, chat_id, sprint_id),
+            )
+            conn.execute(
+                """INSERT INTO members (user_id, user_name)
+                   VALUES (?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET user_name=excluded.user_name""",
+                (user_id, user_name),
+            )
+            return jsonify({"score": None, "status": "duplicate_submission", "user_name": user_name, "sprint_id": sprint_id}), 422
+
         conn.execute(
             """INSERT INTO plays (user_id, user_name, chat_id, score, scan_status, sprint_id)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -301,9 +335,9 @@ def score():
         )
 
     if status == "success":
-        return jsonify({"score": computed_score, "status": "success", "sprint_id": sprint_id})
+        return jsonify({"score": computed_score, "status": "success", "user_name": user_name, "sprint_id": sprint_id})
     else:
-        return jsonify({"score": None, "status": status, "sprint_id": sprint_id}), 422
+        return jsonify({"score": None, "status": status, "user_name": user_name, "sprint_id": sprint_id}), 422
 
 
 @app.post("/score/correct")
@@ -404,7 +438,7 @@ def stats():
     chat_id = request.args.get("chat_id")
 
     query = """
-        SELECT COUNT(*) AS plays,
+        SELECT COUNT(CASE WHEN scan_status != 'duplicate_submission' THEN 1 END) AS plays,
                SUM(CASE WHEN scan_status IN ('success', 'manual') THEN 1 ELSE 0 END) AS scored,
                SUM(score) AS total_score
         FROM plays
