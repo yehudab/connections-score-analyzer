@@ -134,6 +134,18 @@ def resolve_sprint(sprint_param):
     return int(sprint_param)
 
 
+def ranked(rows):
+    """Add a 'rank' field to each row. Tied scores get '-' instead of a number."""
+    result = []
+    prev_score = None
+    for i, row in enumerate(rows, 1):
+        r = dict(row)
+        r["rank"] = "-" if (prev_score is not None and r.get("total_score") == prev_score) else i
+        prev_score = r.get("total_score")
+        result.append(r)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -259,7 +271,7 @@ def sprint_end_report():
         "sprint_id": finished_sprint_id,
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "rankings": [dict(r) for r in rows],
+        "rankings": ranked(rows),
     })
 
 
@@ -424,7 +436,7 @@ def leaderboard():
         "sprint_id": sid,
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "leaderboard": [dict(r) for r in rows],
+        "leaderboard": ranked(rows),
     })
 
 
@@ -493,7 +505,7 @@ def summary():
         "start": start.isoformat(),
         "end": end.isoformat(),
         "text": "\n".join(lines),
-        "rankings": [dict(r) for r in rows],
+        "rankings": ranked(rows),
     })
 
 
