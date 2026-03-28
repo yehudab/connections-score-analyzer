@@ -248,9 +248,9 @@ def sprint_end_report():
     start, end = sprint_date_range(finished_sprint_id)
 
     query = """
-        SELECT user_id,
+        SELECT REPLACE(p.user_id, '@lid', '') AS user_id,
                (SELECT user_name FROM plays p2
-                WHERE p2.user_id = p.user_id
+                WHERE REPLACE(p2.user_id, '@lid', '') = REPLACE(p.user_id, '@lid', '')
                 ORDER BY played_at DESC LIMIT 1) AS user_name,
                COUNT(*) AS plays,
                SUM(score) AS total_score
@@ -261,7 +261,7 @@ def sprint_end_report():
     if chat_id:
         query += " AND chat_id = ?"
         params.append(chat_id)
-    query += " GROUP BY user_id ORDER BY total_score DESC"
+    query += " GROUP BY REPLACE(p.user_id, '@lid', '') ORDER BY total_score DESC"
 
     with db() as conn:
         rows = conn.execute(query, params).fetchall()
@@ -414,9 +414,9 @@ def leaderboard():
     chat_id = request.args.get("chat_id")
 
     query = """
-        SELECT user_id,
+        SELECT REPLACE(p.user_id, '@lid', '') AS user_id,
                (SELECT user_name FROM plays p2
-                WHERE p2.user_id = p.user_id
+                WHERE REPLACE(p2.user_id, '@lid', '') = REPLACE(p.user_id, '@lid', '')
                 ORDER BY played_at DESC LIMIT 1) AS user_name,
                COUNT(*) AS plays,
                SUM(score) AS total_score
@@ -427,7 +427,7 @@ def leaderboard():
     if chat_id:
         query += " AND chat_id = ?"
         params.append(chat_id)
-    query += " GROUP BY user_id ORDER BY total_score DESC"
+    query += " GROUP BY REPLACE(p.user_id, '@lid', '') ORDER BY total_score DESC"
 
     with db() as conn:
         rows = conn.execute(query, params).fetchall()
@@ -454,7 +454,7 @@ def stats():
                SUM(CASE WHEN scan_status IN ('success', 'manual') THEN 1 ELSE 0 END) AS scored,
                SUM(score) AS total_score
         FROM plays
-        WHERE user_id = ? AND sprint_id = ?
+        WHERE REPLACE(user_id, '@lid', '') = REPLACE(?, '@lid', '') AND sprint_id = ?
     """
     params = [user_id, sid]
     if chat_id:
@@ -478,9 +478,9 @@ def summary():
     chat_id = request.args.get("chat_id")
 
     query = """
-        SELECT user_id,
+        SELECT REPLACE(p.user_id, '@lid', '') AS user_id,
                (SELECT user_name FROM plays p2
-                WHERE p2.user_id = p.user_id
+                WHERE REPLACE(p2.user_id, '@lid', '') = REPLACE(p.user_id, '@lid', '')
                 ORDER BY played_at DESC LIMIT 1) AS user_name,
                COUNT(*) AS plays,
                SUM(score) AS total_score
@@ -491,7 +491,7 @@ def summary():
     if chat_id:
         query += " AND chat_id = ?"
         params.append(chat_id)
-    query += " GROUP BY user_id ORDER BY total_score DESC"
+    query += " GROUP BY REPLACE(p.user_id, '@lid', '') ORDER BY total_score DESC"
 
     with db() as conn:
         rows = conn.execute(query, params).fetchall()
