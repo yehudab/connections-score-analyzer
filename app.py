@@ -318,7 +318,7 @@ def score():
         if existing is not None:
             # Not a game image — don't penalise, don't record
             if status == "failed:not_a_game":
-                return jsonify({"score": None, "status": status, "user_name": user_name, "sprint_id": sprint_id}), 422
+                return jsonify({"score": None, "status": status, "user_name": user_name}), 422
             # Any other result (success or parse failure) → duplicate_submission
             conn.execute(
                 """INSERT INTO plays (user_id, user_name, chat_id, score, scan_status, sprint_id)
@@ -331,7 +331,7 @@ def score():
                    ON CONFLICT(user_id) DO UPDATE SET user_name=excluded.user_name""",
                 (user_id, user_name),
             )
-            return jsonify({"score": None, "status": "duplicate_submission", "user_name": user_name, "sprint_id": sprint_id}), 422
+            return jsonify({"score": None, "status": "duplicate_submission", "user_name": user_name}), 422
 
         conn.execute(
             """INSERT INTO plays (user_id, user_name, chat_id, score, scan_status, sprint_id)
@@ -347,9 +347,9 @@ def score():
         )
 
     if status == "success":
-        return jsonify({"score": computed_score, "status": "success", "user_name": user_name, "sprint_id": sprint_id})
+        return jsonify({"score": computed_score, "status": "success", "user_name": user_name})
     else:
-        return jsonify({"score": None, "status": status, "user_name": user_name, "sprint_id": sprint_id}), 422
+        return jsonify({"score": None, "status": status, "user_name": user_name}), 422
 
 
 @app.post("/score/correct")
