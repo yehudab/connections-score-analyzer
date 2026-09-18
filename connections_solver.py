@@ -258,6 +258,10 @@ _GROUP_SCHEMA_EXAMPLE = """{
 }"""
 
 
+# Running totals for the OpenRouter path, read by the benchmark harness.
+LLM_USAGE = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+
+
 def _llm_client() -> OpenAI:
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
@@ -357,6 +361,10 @@ Required JSON format:
         max_tokens=16000,
     )
     usage = response.usage
+    LLM_USAGE["calls"] += 1
+    if usage:
+        LLM_USAGE["prompt_tokens"] += usage.prompt_tokens or 0
+        LLM_USAGE["completion_tokens"] += usage.completion_tokens or 0
     print(
         f"[llm] response received id={response.id}"
         f" prompt_tokens={usage.prompt_tokens if usage else '?'}"

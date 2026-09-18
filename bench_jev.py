@@ -31,7 +31,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from connections_solver import MAX_MISTAKES, _load_env_file
+from connections_solver import LLM_USAGE, MAX_MISTAKES, _load_env_file, make_openrouter_strategy
 from jev_solver import JevBeamStrategy, JevBlankStrategy, JevStrategy, JevWordplayStrategy, OBJECTIVES
 
 _load_env_file()
@@ -187,7 +187,10 @@ def run_puzzle(puzzle: dict, cache: dict, args: argparse.Namespace) -> dict:
     board = [w for a in puzzle["answers"] for w in a["members"]]
     random.Random(f"{args.seed}:{puzzle['id']}").shuffle(board)
 
-    if args.strategy in ("beam", "wordplay", "blanks"):
+    if args.strategy == "openrouter":
+        import os
+        strategy = make_openrouter_strategy(args.model or os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-pro"))
+    elif args.strategy in ("beam", "wordplay", "blanks"):
         cls = {"beam": JevBeamStrategy, "wordplay": JevWordplayStrategy, "blanks": JevBlankStrategy}[args.strategy]
         extra = {}
         if args.strategy in ("wordplay", "blanks"):
@@ -214,8 +217,14 @@ def run_puzzle(puzzle: dict, cache: dict, args: argparse.Namespace) -> dict:
             verbose=args.verbose,
             timeout=args.timeout,
         )
+    usage_before = dict(LLM_USAGE)
     t0 = time.monotonic()
-    result = simulate(strategy, board, solution, verbose=args.verbose)
+    try:
+        result = simulate(strategy, board, solution, verbose=args.verbose)
+    except Exception as e:  # keep the run going; an API/parse failure is a failed puzzle
+        print(f"    ERROR: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+        result = {"success": False, "mistakes": 0, "groups_solved": 0, "solved": [], "guesses": [],
+                  "resolves": 0, "error": f"{type(e).__name__}: {str(e)[:300]}"}
     elapsed = time.monotonic() - t0
 
     unsolved = [g for g in solution if g not in {frozenset(s) for s in result["solved"]}]
@@ -223,10 +232,11 @@ def run_puzzle(puzzle: dict, cache: dict, args: argparse.Namespace) -> dict:
         "id": puzzle["id"],
         "date": puzzle["date"],
         "elapsed_seconds": round(elapsed, 2),
-        "search_seconds": round(strategy.search_seconds, 2),
-        "requests": strategy.requests,
-        "input_tokens": strategy.input_tokens,
-        "model": strategy.model_used,
+        "search_seconds": round(getattr(strategy, "search_seconds", 0.0), 2),
+        "requests": getattr(strategy, "requests", LLM_USAGE["calls"] - usage_before["calls"]),
+        "input_tokens": getattr(strategy, "input_tokens", LLM_USAGE["prompt_tokens"] - usage_before["prompt_tokens"]),
+        "output_tokens": getattr(strategy, "output_tokens", LLM_USAGE["completion_tokens"] - usage_before["completion_tokens"]),
+        "model": getattr(strategy, "model_used", None),
         "unsolved": [
             {"group": theme_of[g], "level": level_of[g], "members": sorted(g)} for g in unsolved
         ],
@@ -238,7 +248,7 @@ def run_puzzle(puzzle: dict, cache: dict, args: argparse.Namespace) -> dict:
     return result
 
 
-def print_summary(results: list[dict], price_per_mtok: float) -> None:
+def print_summary(results: list[dict], price_per_mtok: float, price_in: float = 5.0, price_out: float = 25.0) -> None:
     n = len(results)
     solved = sum(r["success"] for r in results)
     mistakes = Counter(r["mistakes"] for r in results)
@@ -263,7 +273,15 @@ def print_summary(results: list[dict], price_per_mtok: float) -> None:
             + "   (0 = yellow/easiest … 3 = purple/hardest; -1 = unknown)"
         )
     print(f"Jev requests:       {requests}  ({requests / n:.2f} per puzzle; 0 means cache replay)")
+    out_tokens = sum(r.get("output_tokens", 0) for r in results)
+    errors = sum(1 for r in results if r.get("error"))
     print(f"Input tokens:       {tokens:,}  (~${tokens / 1e6 * price_per_mtok:.4f} at ${price_per_mtok}/Mtok)")
+    if out_tokens:
+        print(f"Output tokens:      {out_tokens:,}")
+        est = (tokens * price_in + out_tokens * price_out) / 1e6
+        print(f"Est. LLM spend:     ${est:.2f}  (at ${price_in}/Mtok in, ${price_out}/Mtok out)")
+    if errors:
+        print(f"Errors:             {errors} puzzle(s) failed with an exception")
     print(f"Time:               API {api_time:.1f}s, partition search {search_time:.1f}s")
     print("=" * 64)
 
@@ -273,8 +291,12 @@ def main() -> None:
     ap.add_argument("--last", type=int, default=50, help="use the N most recent puzzles (default 50)")
     ap.add_argument("--before", metavar="YYYY-MM-DD", help="only puzzles dated strictly before this")
     ap.add_argument("--ids", help="comma-separated puzzle ids (overrides --last/--before)")
-    ap.add_argument("--strategy", choices=["pairwise", "beam", "wordplay", "blanks"], default="pairwise",
-                    help="pairwise: 120 Nouls; beam: staged Choice questions; wordplay: beam + hidden-word hypotheses; blanks: wordplay + fill-in-the-blank hypotheses")
+    ap.add_argument("--strategy", choices=["pairwise", "beam", "wordplay", "blanks", "openrouter"], default="pairwise",
+                    help="Jev: pairwise (120 Nouls), beam (staged Choice), wordplay (+hidden-word hypotheses), blanks (+fill-in-the-blank); openrouter: the LLM solver")
+    ap.add_argument("--model", help="(openrouter) model id; default $OPENROUTER_MODEL")
+    ap.add_argument("--budget-usd", type=float, help="(openrouter) stop when estimated spend reaches this")
+    ap.add_argument("--price-in", type=float, default=5.0, help="(openrouter) $ per Mtok input for the estimate")
+    ap.add_argument("--price-out", type=float, default=25.0, help="(openrouter) $ per Mtok output for the estimate")
     ap.add_argument("--bl-cap", type=int, default=400, help="(blanks) max dictionary candidates verified")
     ap.add_argument("--bl-min-members", type=int, default=3, help="(blanks) board words a candidate must pair with")
     ap.add_argument("--bl-weight", type=float, default=3.0, help="(blanks) bonus weight")
@@ -325,14 +347,20 @@ def main() -> None:
                 + (f"  missed: {miss}" if miss else ""),
                 file=sys.stderr,
             )
-            if not args.no_cache:
+            if not args.no_cache and args.strategy != "openrouter":
                 save_cache(cache, Path(args.cache))
+            if args.strategy == "openrouter" and args.budget_usd:
+                spent = (LLM_USAGE["prompt_tokens"] * args.price_in + LLM_USAGE["completion_tokens"] * args.price_out) / 1e6
+                print(f"    est. spend so far ${spent:.2f}", file=sys.stderr)
+                if spent >= args.budget_usd:
+                    print(f"budget of ${args.budget_usd:.2f} reached after {i} puzzles — stopping", file=sys.stderr)
+                    break
     except KeyboardInterrupt:
         print("\ninterrupted — summarising what finished", file=sys.stderr)
 
     if not results:
         return
-    print_summary(results, args.price)
+    print_summary(results, args.price, args.price_in, args.price_out)
 
     out = Path(args.out) if args.out else BENCH_DIR / f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     out.parent.mkdir(exist_ok=True)
