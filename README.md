@@ -289,7 +289,9 @@ Offline benchmark against past puzzles (answers cached in `bench-data/`, so re-r
 ./bench_jev.py --strategy blanks --ids 1188 -v      # one puzzle, every guess and Jev call
 ```
 
-On the 50 most recent puzzles: pairwise 21/50, beam 28/50, wordplay 33/50, blanks 38/50.
+On the 50 most recent puzzles: pairwise 21/50, beam 28/50, wordplay 33/50, blanks 40/50.
+The full write-up of the experiment, with what worked and what did not, is in
+[JEV-RESEARCH.md](JEV-RESEARCH.md).
 
 ## Troubleshooting
 
