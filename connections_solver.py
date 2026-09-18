@@ -99,21 +99,53 @@ TILE_SELECTORS = [
     '[class*="Tile"] span',
 ]
 
-# JS helper: the word shown on a tile element. Newer NYT markup duplicates the
-# word in an aria-hidden span, so prefer the visible span and, failing that,
-# collapse an exactly doubled string ("PILLOWPILLOW" -> "PILLOW").
-_TILE_TEXT_JS = """
-    const norm = s => s.replace(/\\s+/g, ' ').trim();
+# Sept 2026 markup: every tile is a visually-hidden checkbox
+#   <input data-testid="card-input" id="inner-card-N" aria-label="WORD" value="WORD">
+# with an associated <label> that renders the word (twice: visible + aria-hidden).
+# The input is the source of truth: aria-label for the word, .checked for
+# selection, .disabled for readiness. Older selectors remain as fallbacks.
+TILE_INPUT_SELECTOR = 'input[data-testid="card-input"]'
+
+# Shared JS helpers, prepended to the page snippets below.
+_TILE_JS = """
+    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+    const INPUT_SEL = %s;
+    const SELECTORS = %s;
+    // Word on a legacy tile element: prefer the visible span, else collapse
+    // an exactly doubled string ("PILLOWPILLOW" -> "PILLOW").
     const tileText = el => {
+        if (el.tagName === 'INPUT') return norm(el.getAttribute('aria-label') || el.value);
         const visible = Array.from(el.querySelectorAll('span')).find(s => !s.hasAttribute('aria-hidden'));
         let t = norm(visible ? visible.textContent : el.textContent);
         const h = t.length / 2;
-        if (!visible && t.length % 2 === 0 && h > 0 && t.slice(0, h) === t.slice(h)) t = t.slice(0, h);
+        if (!visible && t.length %% 2 === 0 && h > 0 && t.slice(0, h) === t.slice(h)) t = t.slice(0, h);
         return t;
     };
-    const clickable = el => el.closest('label') || el.closest('button') || el;
-"""
-_TILE_SELECTORS_JS = json.dumps(TILE_SELECTORS)
+    // All tile elements: the inputs when present, else the first legacy selector with 16 hits.
+    const tileElements = () => {
+        const inputs = Array.from(document.querySelectorAll(INPUT_SEL));
+        if (inputs.length) return inputs;
+        for (const sel of SELECTORS) {
+            const els = Array.from(document.querySelectorAll(sel)).filter(e => tileText(e));
+            if (els.length === 16) return els;
+        }
+        return [];
+    };
+    const findTile = word => tileElements().find(e => tileText(e) === word) || null;
+    // What to click for a tile element: the input's label, or the enclosing label/button.
+    const clickable = el => el.tagName === 'INPUT'
+        ? ((el.labels && el.labels[0]) || el)
+        : (el.closest('label') || el.closest('button') || el);
+    const isSelected = el => el.tagName === 'INPUT'
+        ? el.checked
+        : Array.from(clickable(el).classList).some(c => c.startsWith('Card-module_selected__'));
+    const isReady = el => {
+        if (el.tagName === 'INPUT') return !el.disabled;
+        const t = clickable(el);
+        const ctl = t.tagName === 'LABEL' ? (t.control || t.querySelector('input')) : t;
+        return !(ctl && ctl.disabled) && t.getAttribute('aria-disabled') !== 'true';
+    };
+""" % (json.dumps(TILE_INPUT_SELECTOR), json.dumps(TILE_SELECTORS))
 
 # NYT gives 4 mistakes before game over
 MAX_MISTAKES = 4
@@ -190,16 +222,9 @@ async def dismiss_overlays(page) -> None:
 
 
 async def extract_tiles(page) -> list[str]:
-    for selector in TILE_SELECTORS:
-        try:
-            tiles = await page.eval_on_selector_all(
-                selector,
-                "els => {" + _TILE_TEXT_JS + " return els.map(tileText).filter(t => t.length > 0); }",
-            )
-            if len(tiles) == 16:
-                return tiles
-        except Exception:
-            pass
+    tiles = await page.evaluate("() => {" + _TILE_JS + " return tileElements().map(tileText).filter(t => t); }")
+    if len(tiles) == 16:
+        return tiles
 
     # Broad fallback: short button texts that look like game tiles
     return await page.evaluate("""() => {
@@ -408,37 +433,28 @@ def required_key_for(solver: str) -> str:
 
 
 def _find_tile_js() -> str:
-    """JS snippet that returns the clickable element for a given word, or null."""
-    return """(word) => {""" + _TILE_TEXT_JS + """
-        for (const sel of """ + _TILE_SELECTORS_JS + """) {
-            const el = Array.from(document.querySelectorAll(sel)).find(el => tileText(el) === word);
-            if (el) return clickable(el);
-        }
-        // Fallback: button whose text matches exactly
-        return Array.from(document.querySelectorAll('button')).find(b => tileText(b) === word) || null;
-    }"""
-
-
-def _is_selected_js() -> str:
-    """JS snippet: returns true if the element has a Card-module_selected__ class."""
-    return """(el) => Array.from(el.classList).some(c => c.startsWith('Card-module_selected__'))"""
+    """JS snippet: (word) -> the tile element (input or legacy element), or null."""
+    return "(word) => {" + _TILE_JS + " return findTile(word); }"
 
 
 async def click_tile(page, word: str) -> None:
-    # Locate the button via JS handle so we can inspect it after clicking
-    btn = await page.evaluate_handle(_find_tile_js(), word)
-    if await btn.evaluate("el => el === null"):
+    tile = await page.evaluate_handle(_find_tile_js(), word)
+    if await tile.evaluate("el => el === null"):
         raise ValueError(f"Tile not found: {word!r}")
 
-    # force=True bypasses Playwright's actionability checks (enabled/aria-disabled)
-    # but still dispatches real pointer events that React's event system handles.
-    # Readiness was already confirmed by wait_for_board_ready.
-    await btn.as_element().click(force=True)
+    # NYT keeps tiles selected after a wrong guess; clicking a selected tile
+    # would deselect it, so leave it alone.
+    if await tile.evaluate("el => {" + _TILE_JS + " return isSelected(el); }"):
+        return
+
+    # Click the label (for a hidden checkbox) or the button. force=True bypasses
+    # Playwright's actionability checks but still dispatches real pointer
+    # events; readiness was already confirmed by wait_for_board_ready.
+    target = await tile.evaluate_handle("el => {" + _TILE_JS + " return clickable(el); }")
+    await target.as_element().click(force=True)
     await page.wait_for_timeout(300)
 
-    # Verify the tile is now marked as selected
-    selected = await btn.evaluate(_is_selected_js())
-    if not selected:
+    if not await tile.evaluate("el => {" + _TILE_JS + " return isSelected(el); }"):
         raise ValueError(f"Tile clicked but did not become selected: {word!r}")
 
 
@@ -455,12 +471,25 @@ async def click_submit(page) -> None:
 
 
 async def deselect_all(page) -> None:
+    """Clear the current selection: the Deselect button first, then any tile still selected."""
     await page.evaluate("""() => {
         const btn = Array.from(document.querySelectorAll('button'))
             .find(b => /deselect/i.test(b.textContent));
         if (btn) btn.click();
     }""")
     await page.wait_for_timeout(400)
+    # Fallback for tiles that stayed selected (button disabled mid-animation etc.)
+    for _ in range(3):
+        still = await page.evaluate(
+            "() => {" + _TILE_JS + """
+                const sel = tileElements().filter(isSelected);
+                sel.forEach(el => clickable(el).click());
+                return sel.length;
+            }"""
+        )
+        if not still:
+            break
+        await page.wait_for_timeout(400)
 
 
 async def read_feedback(page, submitted: list[str]) -> str:
@@ -490,25 +519,10 @@ async def read_feedback(page, submitted: list[str]) -> str:
 
 
 async def wait_for_board_ready(page, members: list[str]) -> None:
-    """Wait until the first tile of the next group is visible and fully interactive."""
-    word = members[0]
+    """Wait until the first tile of the next group exists and is interactive."""
     await page.wait_for_function(
-        """(word) => {""" + _TILE_TEXT_JS + """
-            for (const sel of """ + _TILE_SELECTORS_JS + """) {
-                const el = Array.from(document.querySelectorAll(sel)).find(e => tileText(e) === word);
-                if (el) {
-                    const target = clickable(el);
-                    // A <label> tile is disabled through its associated input
-                    const ctl = target.tagName === 'LABEL'
-                        ? (target.control || document.getElementById(target.htmlFor) || target.querySelector('input'))
-                        : target;
-                    if (ctl && ctl.disabled) return false;
-                    return target.getAttribute('aria-disabled') !== 'true';
-                }
-            }
-            return false;
-        }""",
-        arg=word,
+        "(word) => {" + _TILE_JS + " const el = findTile(word); return !!el && isReady(el); }",
+        arg=members[0],
         timeout=15_000,
     )
 
