@@ -141,8 +141,26 @@ def simulate(strategy, board: list[str], solution: list[frozenset[str]], verbose
         else:
             mistakes += 1
             failed_guesses.append({"members": members, "feedback": fb})
-            if mistakes < MAX_MISTAKES:
-                # Jev groups carry no alternatives: always re-solve with constraints.
+            if mistakes >= MAX_MISTAKES:
+                break
+            alternatives = list(group.get("alternatives", []))
+            applied = False
+            if fb == "one_away":
+                one_away = getattr(strategy, "one_away", None)
+                if one_away is not None:
+                    fresh = one_away(members, remaining, failed_guesses)
+                    if fresh:
+                        alternatives = fresh
+                # Mirror play_game: apply the group's pre-computed swap first.
+                while alternatives:
+                    alt = alternatives.pop(0)
+                    rm, add = alt.get("remove"), alt.get("add")
+                    if rm in members and add in remaining and add not in members:
+                        new_members = [add if w == rm else w for w in members]
+                        groups.insert(0, {"theme": group.get("theme"), "members": new_members, "alternatives": alternatives})
+                        applied = True
+                        break
+            if not applied:
                 groups = strategy(remaining, failed_guesses)
                 resolves += 1
 

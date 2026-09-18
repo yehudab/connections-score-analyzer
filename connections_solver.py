@@ -610,6 +610,14 @@ async def play_game(page, tiles: list[str], strategy) -> tuple[bool, int, list[d
             print(f"    ~ One Away! ({mistakes}/{MAX_MISTAKES} mistakes used)")
             failed_guesses.append({"members": members, "feedback": "one_away"})
 
+            # A strategy that can use the feedback as new information (Jev asks
+            # "which one does not belong?") overrides pre-computed alternatives.
+            one_away = getattr(strategy, "one_away", None)
+            if one_away is not None and mistakes < MAX_MISTAKES:
+                fresh = one_away(members, remaining, failed_guesses)
+                if fresh:
+                    alternatives = fresh
+
             if alternatives:
                 alt = alternatives.pop(0)
                 remove_word = alt.get("remove")

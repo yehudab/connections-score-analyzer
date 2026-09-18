@@ -334,6 +334,33 @@ def best_partition(
     return best["groups"]
 
 
+def swap_alternatives(
+    members: list[str],
+    remaining: list[str],
+    scorer: Callable[[frozenset[str]], float],
+    constraints: Constraints,
+    k: int = 2,
+) -> list[dict]:
+    """Best single swaps for a group, for play_game's "one away" handling.
+
+    A "one away" means exactly three of the four are right, so the answer is
+    one of the 4 x (n-4) single swaps. Rank them by the strategy's own score
+    and hand the top k to play_game as {"remove", "add"} alternatives; it
+    applies them before falling back to a full re-solve.
+    """
+    cands = []
+    for m in members:
+        for w in remaining:
+            if w in members:
+                continue
+            g = frozenset(x for x in members if x != m) | {w}
+            if not _group_allowed(g, constraints):
+                continue
+            cands.append((scorer(g), m, w))
+    cands.sort(key=lambda t: t[0], reverse=True)
+    return [{"remove": m, "add": w} for _, m, w in cands[:k]]
+
+
 # ---------------------------------------------------------------------------
 # Strategy
 # ---------------------------------------------------------------------------
@@ -435,6 +462,7 @@ class JevStrategy:
         if partition is None:
             return []
 
+        scorer = lambda g: group_score(tuple(g), pairs, self.objective)  # noqa: E731
         groups = []
         for g in partition:
             members = sorted(g, key=remaining.index)
@@ -442,7 +470,7 @@ class JevStrategy:
             groups.append({
                 "theme": f"jev affinity {mean_p:.2f}",
                 "members": members,
-                "alternatives": [],
+                "alternatives": swap_alternatives(members, remaining, scorer, constraints),
                 "score": round(group_score(tuple(members), pairs, self.objective), 3),
                 "mean_affinity": round(mean_p, 3),
             })
@@ -794,10 +822,11 @@ class JevBeamStrategy:
         groups = []
         for g in partition:
             s = self.subset_score(g)
+            members = sorted(g, key=remaining.index)
             groups.append({
                 "theme": f"jev beam {s:.2f}",
-                "members": sorted(g, key=remaining.index),
-                "alternatives": [],
+                "members": members,
+                "alternatives": swap_alternatives(members, remaining, self.subset_score, constraints),
                 "score": round(s, 3),
                 "mean_affinity": round(s, 3),
             })
@@ -811,6 +840,77 @@ class JevBeamStrategy:
             for g in groups:
                 self._log(f"  {g['score']:.2f}  {g['members']}")
         return groups
+
+    # -- feedback-driven follow-up -------------------------------------------------
+
+    def one_away(
+        self, members: list[str], remaining: list[str], failed_guesses: list[dict] | None = None
+    ) -> list[dict]:
+        """Ask Jev about a "one away" guess now that we know one member is an intruder.
+
+        One request: an odd-one-out Choice over the four members (well-posed here,
+        since exactly one does not belong) plus, speculatively, a completion
+        Choice for each of the four possible trios over the other board words.
+        Swaps are ranked by P(odd = m) * P(completion = w), with the strategy's
+        own subset score as tiebreak, and returned as play_game alternatives.
+        """
+        outsiders = [w for w in remaining if w not in members]
+        if len(outsiders) < 1:
+            return []
+        constraints = project_constraints(remaining, failed_guesses)
+        questions: dict[str, Choice] = {
+            "odd": Choice(
+                instructions=(
+                    f"Exactly three of the words {_quote(members)} belong to one Connections "
+                    f"category of four and one does not. Which one does not belong?"
+                ),
+                criteria={m: None for m in members},
+            )
+        }
+        for i, m in enumerate(members):
+            trio = [x for x in members if x != m]
+            questions[f"fill{i}"] = Choice(
+                instructions=(
+                    f"{_quote(trio)} are three words of one Connections category of four. "
+                    f"Which board word completes the category?"
+                ),
+                criteria={w: None for w in outsiders},
+            )
+        r = self._stage("one-away", remaining, questions)
+        p_odd = r.answers["odd"]["probabilities"]
+
+        # The globally constrained re-solve already knows which trio-plus-one the
+        # whole board prefers (the group holding exactly 3 of the guess). A swap
+        # question alone cannot see that a red herring fits better elsewhere.
+        global_pick: frozenset[str] | None = None
+        partition = best_partition(remaining, None, constraints, scorer=self.subset_score)
+        if partition:
+            global_pick = next((g for g in partition if len(g & frozenset(members)) == 3), None)
+
+        raw = []
+        for i, m in enumerate(members):
+            fill = r.answers[f"fill{i}"]["probabilities"]
+            for w in outsiders:
+                g = frozenset(x for x in members if x != m) | {w}
+                if not _group_allowed(g, constraints):
+                    continue
+                raw.append((p_odd.get(m, 0.0) * fill.get(w, 0.0), self.subset_score(g), g == global_pick, m, w))
+        if not raw:
+            return []
+        max_jev = max(t[0] for t in raw)
+        # Jev's own answer ranks best on the benchmark (44% of swaps land at once
+        # vs 35% for a blend). Only when its probabilities collapse (no swap above
+        # 0.05) fall back to global agreement, then the structural score.
+        if max_jev >= 0.05:
+            key = lambda t: (t[0], float(t[2]), t[1])  # noqa: E731
+        else:
+            key = lambda t: (float(t[2]), t[1], t[0])  # noqa: E731
+        cands = sorted(((key(t), *t) for t in raw), reverse=True)
+        if self.verbose:
+            self._log("one-away follow-up: odd-one-out " + ", ".join(f"{m} {p_odd.get(m, 0):.2f}" for m in members))
+            for _, pj, ps, glob, m, w in cands[:3]:
+                self._log(f"  swap {m} -> {w}   jev={pj:.2f} structural={ps:.2f}{' global' if glob else ''}")
+        return [{"remove": m, "add": w} for _, _, _, _, m, w in cands[:3]]
 
     def _dump_debug(self) -> None:
         assert self.debug_dir is not None and self.board is not None
