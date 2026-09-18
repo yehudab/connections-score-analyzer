@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 from connections_solver import MAX_MISTAKES, _load_env_file
-from jev_solver import JevBeamStrategy, JevStrategy, OBJECTIVES
+from jev_solver import JevBeamStrategy, JevStrategy, JevWordplayStrategy, OBJECTIVES
 
 _load_env_file()
 
@@ -169,8 +169,16 @@ def run_puzzle(puzzle: dict, cache: dict, args: argparse.Namespace) -> dict:
     board = [w for a in puzzle["answers"] for w in a["members"]]
     random.Random(f"{args.seed}:{puzzle['id']}").shuffle(board)
 
-    if args.strategy == "beam":
-        strategy = JevBeamStrategy(
+    if args.strategy in ("beam", "wordplay"):
+        cls = JevWordplayStrategy if args.strategy == "wordplay" else JevBeamStrategy
+        extra = (
+            dict(wp_weight=args.wp_weight, wp_verify=args.wp_verify,
+                 wp_threshold=args.wp_threshold, wp_verify_mode=args.wp_verify_mode,
+                 wp_duels=not args.no_duels)
+            if args.strategy == "wordplay" else {}
+        )
+        strategy = cls(
+            **extra,
             triple_beam=args.beam_triples,
             verify_quads=args.verify_quads,
             weights=tuple(float(x) for x in args.weights.split(",")),
@@ -244,8 +252,13 @@ def main() -> None:
     ap.add_argument("--last", type=int, default=50, help="use the N most recent puzzles (default 50)")
     ap.add_argument("--before", metavar="YYYY-MM-DD", help="only puzzles dated strictly before this")
     ap.add_argument("--ids", help="comma-separated puzzle ids (overrides --last/--before)")
-    ap.add_argument("--strategy", choices=["pairwise", "beam"], default="pairwise",
-                    help="pairwise: 120 Nouls + partition search; beam: staged Choice questions")
+    ap.add_argument("--strategy", choices=["pairwise", "beam", "wordplay"], default="pairwise",
+                    help="pairwise: 120 Nouls; beam: staged Choice questions; wordplay: beam + code-generated hidden-word hypotheses")
+    ap.add_argument("--wp-weight", type=float, default=3.0, help="(wordplay) weight of a verified hypothesis")
+    ap.add_argument("--wp-verify", type=int, default=600, help="(wordplay) hypotheses sent to verification")
+    ap.add_argument("--wp-threshold", type=float, default=0.6, help="(wordplay) min verified score to count")
+    ap.add_argument("--no-duels", action="store_true", help="(wordplay) skip the stage-C duel questions")
+    ap.add_argument("--wp-verify-mode", choices=["score", "odd", "noul"], default="score", help="(wordplay) verification question")
     ap.add_argument("--objective", choices=sorted(OBJECTIVES), default="linear",
                     help="(pairwise) how pair probabilities combine into a group score")
     ap.add_argument("--beam-triples", type=int, default=200, help="(beam) triples carried into stage 3")

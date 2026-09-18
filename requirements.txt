@@ -18,3 +18,4 @@ pytesseract==0.3.13
 typing_extensions==4.15.0
 Werkzeug==3.1.6
 typesafe-sdk>=0.6.0
+wordfreq>=3.0

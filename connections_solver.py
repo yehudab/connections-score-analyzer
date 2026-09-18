@@ -348,9 +348,9 @@ def make_strategy(solver: str, *, debug: bool = False):
         return make_openrouter_strategy(model)
     if solver == "jev":
         # lazy import: typesafe-sdk is only needed for this path
-        from jev_solver import JevBeamStrategy, JevStrategy
+        from jev_solver import JevBeamStrategy, JevStrategy, JevWordplayStrategy
 
-        variant = os.environ.get("JEV_STRATEGY", "beam").strip().lower()
+        variant = os.environ.get("JEV_STRATEGY", "wordplay").strip().lower()
         common = dict(
             model=os.environ.get("TYPESAFE_DEFAULT_MODEL"),
             debug_dir=SOLVER_DEBUG_DIR if debug else None,
@@ -359,7 +359,9 @@ def make_strategy(solver: str, *, debug: bool = False):
             return JevStrategy(**common)
         if variant == "beam":
             return JevBeamStrategy(**common)
-        raise ValueError(f"unknown JEV_STRATEGY {variant!r}; choose 'beam' or 'pairwise'")
+        if variant == "wordplay":
+            return JevWordplayStrategy(**common)
+        raise ValueError(f"unknown JEV_STRATEGY {variant!r}; choose 'wordplay', 'beam' or 'pairwise'")
     raise ValueError(f"unknown solver {solver!r}; choose from {SOLVERS}")
 
 

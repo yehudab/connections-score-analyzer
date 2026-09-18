@@ -498,7 +498,7 @@ def make_jev_strategy(**kwargs) -> JevStrategy:
 # partition search runs over 4-subset scores instead of pair sums.
 # ---------------------------------------------------------------------------
 
-from typesafe_sdk import Choice  # noqa: E402
+from typesafe_sdk import Choice, Score  # noqa: E402
 
 
 def _quote(words: Iterable[str]) -> str:
@@ -568,8 +568,11 @@ def run_stage(client: TypeSafeClient, board: list[str], questions: dict) -> Stag
     elapsed = time.monotonic() - t0
     answers: dict[str, dict] = {}
     for qid, ans in response.answers.items():
-        if hasattr(ans, "probabilities") and not hasattr(ans, "legend"):
-            answers[qid] = {"probabilities": {k: float(v) for k, v in ans.probabilities.items()}}
+        if hasattr(ans, "probabilities"):
+            # Choice keys are option strings; Score keys are level ints in the SDK
+            answers[qid] = {"probabilities": {str(k): float(v) for k, v in ans.probabilities.items()}}
+            if hasattr(ans, "score"):
+                answers[qid]["score"] = float(ans.score)
         elif hasattr(ans, "noul"):
             answers[qid] = {"noul": float(ans.noul)}
     usage = response.usage
@@ -812,3 +815,272 @@ class JevBeamStrategy:
             lines.append(f"{w:>18}: " + ", ".join(f"{o} {p:.2f}" for p, o in partners))
         (self.debug_dir / f"jevbeam_{ts}_{len(self.board)}.txt").write_text("\n".join(lines))
         self._log(f"debug dump saved to {self.debug_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Beam + code-generated wordplay hypotheses
+#
+# wordplay.py derives hidden-word tokens from each board word (DIMENSION ->
+# DIME, MARIGOLD -> GOLD, BORAT -> BRAT ...). Two more Jev requests turn those
+# into scored 4-word hypotheses:
+#
+#   stage A: one Choice per token — "which other hidden word belongs with
+#            DIME?" over the other tokens of the same mechanism
+#   stage B: one Noul per top hypothesis — "do DIME, PENNY, NICKEL and QUARTER
+#            all belong to one category?" — a plain semantic judgment
+#
+# A verified hypothesis adds wp_weight * noul to that 4-subset's score in the
+# partition search. Letter-pattern groups (palindromes etc.) are added directly.
+# ---------------------------------------------------------------------------
+
+import wordplay as _wp  # noqa: E402
+
+
+def token_choice_question(anchor: _wp.Token, options: list[_wp.Token]) -> Choice:
+    return Choice(
+        instructions=(
+            f"Which other hidden word belongs in the same category of four as "
+            f"{anchor.describe()}? Categories are things like coins, metals, colors, "
+            f"animals, body parts, or synonyms of one idea."
+        ),
+        criteria={t.label: None for t in options},
+    )
+
+
+def token_group_noul(tokens: Iterable[_wp.Token]) -> Noul:
+    words = [t.text for t in tokens]
+    return Noul(
+        instructions=(
+            f"Do the words {_quote(words)} all belong to one common category?"
+        ),
+        criteria={
+            "true": "All four are members of one recognizable category, or all four are synonyms of the same idea.",
+            "false": "At least one of the four does not fit a category shared by the other three.",
+        },
+    )
+
+
+NONE_OPTION = "none: all four belong together equally"
+
+
+def token_odd_one_out(tokens: Iterable[_wp.Token]) -> Choice:
+    """Comparative verification: which token does not fit, or none?"""
+    words = [t.text for t in tokens]
+    criteria: dict[str, str | None] = {w: None for w in words}
+    criteria[NONE_OPTION] = "All four are members of one recognizable category, or synonyms of one idea."
+    return Choice(
+        instructions=(
+            f"Consider the words {_quote(words)}. If exactly three of them share a clear "
+            f"category and one does not fit, which one is the odd one out? "
+            f"If all four fit one category, answer none."
+        ),
+        criteria=criteria,
+    )
+
+
+CATEGORY_LEVELS = [
+    "The words are unrelated, or they are mere fragments/suffixes rather than real words",
+    "Two or three are related but at least one clearly does not belong",
+    "All four belong to one loose or broad category",
+    "All four clearly belong to one specific, nameable category such as coins, metals, fruits, or synonyms of one word",
+]
+CATEGORY_RULES = [
+    "Judge them as ordinary standalone English words or proper names.",
+    "Being word fragments, suffixes, prefixes, abbreviations, or all the same part of speech is NOT a category.",
+    "Plural forms of everyday nouns with nothing else in common is NOT a category.",
+]
+
+
+def token_group_score(tokens: Iterable[_wp.Token]) -> Score:
+    """Graded verification; P(top level) separates true groups from near-misses best."""
+    words = [t.text for t in tokens]
+    return Score(
+        instructions={
+            "question": f"How well do the words {_quote(words)} form a single specific category?",
+            "rules": CATEGORY_RULES,
+        },
+        criteria=CATEGORY_LEVELS,
+    )
+
+
+def token_duel_question(shared: Iterable[str], candidates: Iterable[str]) -> Choice:
+    """Which candidate best completes the category started by the three shared words?"""
+    return Choice(
+        instructions={
+            "question": (
+                f"Which word best completes a specific, nameable category together with "
+                f"{_quote(sorted(shared))}?"
+            ),
+            "rules": CATEGORY_RULES,
+        },
+        criteria={c: None for c in candidates},
+    )
+
+
+class JevWordplayStrategy(JevBeamStrategy):
+    """JevBeamStrategy plus code-generated wordplay hypotheses verified by Jev.
+
+    Stage A Choice probabilities are normalised per anchor (p / max p) before
+    hypotheses are ranked, so a word's clear favourite partners count the same
+    whether the anchor had 12 or 40 options.
+
+    verify_mode: "score" → Score over CATEGORY_LEVELS; score = P(top level)
+                 "noul"  → "do all four belong together?" Noul
+                 "odd"   → odd-one-out Choice; score = P(none is odd)
+    A hypothesis contributes wp_weight * score only when score >= wp_threshold.
+    """
+
+    def __init__(
+        self,
+        *,
+        wp_weight: float = 3.0,
+        wp_verify: int = 600,
+        wp_threshold: float = 0.6,
+        wp_verify_mode: str = "score",
+        wp_duels: bool = True,
+        wp_affinity_norm: str = "relmax",
+        wp_pattern_score: float = 0.9,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.wp_weight = wp_weight
+        self.wp_verify = wp_verify
+        self.wp_threshold = wp_threshold
+        self.wp_verify_mode = wp_verify_mode
+        self.wp_duels = wp_duels
+        self.wp_affinity_norm = wp_affinity_norm
+        self.wp_pattern_score = wp_pattern_score
+        self.wp: dict[frozenset[str], float] = {}
+        self.wp_label: dict[frozenset[str], str] = {}
+        # kept for analysis / debugging
+        self.wp_tokens: list[_wp.Token] = []
+        self.wp_affinity: dict[frozenset[_wp.Token], float] = {}
+        self.wp_hyps: list[_wp.Hypothesis] = []
+
+    def load_board(self, board: list[str]) -> None:
+        super().load_board(board)
+        self._load_wordplay(list(board))
+
+    def _load_wordplay(self, board: list[str]) -> None:
+        self.wp, self.wp_label = {}, {}
+        self.wp_tokens, self.wp_affinity, self.wp_hyps = [], {}, []
+
+        # Deterministic letter patterns need no model.
+        for name, matched in _wp.letter_pattern_groups(board):
+            score = self.wp_pattern_score if len(matched) == 4 else self.wp_pattern_score * 0.6
+            for quad in itertools.combinations(sorted(matched), 4):
+                g = frozenset(quad)
+                if score > self.wp.get(g, 0.0):
+                    self.wp[g], self.wp_label[g] = score, f"pattern:{name}"
+
+        tokens = _wp.board_tokens(board)
+        if len(tokens) < 4:
+            return
+        by_mech: dict[str, list[_wp.Token]] = {}
+        for t in tokens:
+            by_mech.setdefault(t.mechanism, []).append(t)
+
+        # Stage A: token affinities via Choice, per mechanism.
+        qa: dict[str, Choice] = {}
+        anchors: dict[str, tuple[_wp.Token, list[_wp.Token]]] = {}
+        for mech, ts in by_mech.items():
+            for i, t in enumerate(ts):
+                opts = [o for o in ts if o.source != t.source]
+                if len(opts) < 3:
+                    continue
+                qid = f"{mech}{i}"
+                qa[qid] = token_choice_question(t, opts[:250])
+                anchors[qid] = (t, opts[:250])
+        if not qa:
+            return
+        ra = self._stage("stageA-tokens", board, qa)
+        raw: dict[frozenset[_wp.Token], list[float]] = {}
+        for qid, (t, opts) in anchors.items():
+            by_label = {o.label: o for o in opts}
+            probs = ra.answers[qid]["probabilities"]
+            scale = (max(probs.values()) or 1.0) if self.wp_affinity_norm == "relmax" else 1.0
+            for label, p in probs.items():
+                o = by_label.get(label)
+                if o is not None:
+                    raw.setdefault(frozenset((t, o)), []).append(p / scale)
+        affinity = {k: sum(v) / len(v) for k, v in raw.items()}
+
+        hyps = _wp.wordplay_hypotheses(
+            tokens, affinity, top_n=self.wp_verify, subset_shortlist=max(600, self.wp_verify)
+        )
+        self.wp_tokens, self.wp_affinity, self.wp_hyps = tokens, affinity, hyps
+        if not hyps:
+            return
+
+        # Stage B: verify each hypothesis as a plain four-word category.
+        if self.wp_verify_mode == "score":
+            qb = {f"h{i}": token_group_score(h.tokens) for i, h in enumerate(hyps)}
+            rb = self._stage("stageB-score", board, qb)
+            top = str(len(CATEGORY_LEVELS) - 1)
+            for i, h in enumerate(hyps):
+                h.verified = rb.answers[f"h{i}"]["probabilities"].get(top, 0.0)
+        elif self.wp_verify_mode == "odd":
+            qb = {f"h{i}": token_odd_one_out(h.tokens) for i, h in enumerate(hyps)}
+            rb = self._stage("stageB-odd", board, qb)
+            for i, h in enumerate(hyps):
+                h.verified = rb.answers[f"h{i}"]["probabilities"].get(NONE_OPTION, 0.0)
+        else:
+            qb = {f"h{i}": token_group_noul(h.tokens) for i, h in enumerate(hyps)}
+            rb = self._stage("stageB-verify", board, qb)
+            for i, h in enumerate(hyps):
+                h.verified = rb.answers[f"h{i}"]["noul"]
+        # Stage C: duels. Hypotheses that share three token texts but differ in
+        # the fourth compete for the same triple; at most one can be right. Ask
+        # which candidate completes the category and scale losers down.
+        kept = [h for h in hyps if h.verified is not None and h.verified >= self.wp_threshold]
+        if self.wp_duels and kept:
+            by_triple: dict[frozenset[str], dict[str, list[_wp.Hypothesis]]] = {}
+            for h in kept:
+                texts = [t.text for t in h.tokens]
+                for t4 in texts:
+                    tri = frozenset(texts) - {t4}
+                    if len(tri) == 3:
+                        by_triple.setdefault(tri, {}).setdefault(t4, []).append(h)
+            duels = {tri: c for tri, c in by_triple.items() if len(c) >= 2}
+            if duels:
+                keys = list(duels)
+                qc = {f"d{i}": token_duel_question(tri, duels[tri]) for i, tri in enumerate(keys)}
+                rc = self._stage("stageC-duels", board, qc)
+                factor: dict[int, float] = {}
+                for i, tri in enumerate(keys):
+                    probs = rc.answers[f"d{i}"]["probabilities"]
+                    mx = max(probs.values()) or 1.0
+                    for cand, hs in duels[tri].items():
+                        f = probs.get(cand, 0.0) / mx
+                        for h in hs:
+                            factor[id(h)] = min(factor.get(id(h), 1.0), f)
+                for h in kept:
+                    h.verified = h.verified * factor.get(id(h), 1.0)
+                self._log(f"wordplay: {len(duels)} duels among {len(kept)} verified hypotheses")
+
+        for h in hyps:
+            if h.verified > self.wp.get(h.words, 0.0):
+                self.wp[h.words] = h.verified
+                self.wp_label[h.words] = h.describe()
+
+        if self.verbose:
+            top = sorted(self.wp.items(), key=lambda kv: kv[1], reverse=True)[:8]
+            self._log(f"wordplay: {len(tokens)} tokens, {len(hyps)} hypotheses verified; top:")
+            for g, s in top:
+                self._log(f"  {s:.2f}  {sorted(g, key=board.index)}  <- {self.wp_label[g]}")
+
+    def subset_score(self, g: frozenset[str]) -> float:
+        # Ramp from 0 at the threshold to wp_weight at a perfect verification,
+        # so borderline hypotheses barely nudge the beam score.
+        s = self.wp.get(g, 0.0)
+        thr = self.wp_threshold
+        bonus = self.wp_weight * (s - thr) / (1.0 - thr) if s > thr else 0.0
+        return super().subset_score(g) + bonus
+
+    def __call__(self, remaining: list[str], failed_guesses: list[dict] | None = None) -> list[dict]:
+        groups = super().__call__(remaining, failed_guesses)
+        for grp in groups:
+            g = frozenset(grp["members"])
+            if g in self.wp_label:
+                grp["theme"] = f"jev wp {self.wp[g]:.2f} {self.wp_label[g]}"
+        return groups
