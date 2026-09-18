@@ -264,6 +264,33 @@ sudo docker logs picoclaw-gateway --follow
 The `logging` driver in `docker-compose.yml` keeps up to 50MB of history (5 × 10MB files),
 so logs survive container restarts.
 
+## Connections Solver
+
+`connections_solver.py` plays the daily NYT Connections board in a browser and
+screenshots the result. The grouping "brain" is pluggable (`--solver`, or the
+`SOLVER` env var):
+
+| Solver | How it groups | Needs |
+|---|---|---|
+| `openrouter` (default) | An LLM returns groups plus "one away" alternatives | `OPENROUTER_API_KEY` |
+| `jev` | TypeSafe's Jev answers typed questions; grouping, hypothesis generation and feedback handling happen in code | `TYPESAFE_API_KEY` |
+
+The Jev solver has cumulative variants (`JEV_STRATEGY`): `pairwise` (120 same-category
+Nouls + partition search), `beam` (staged Choice questions word → pair → triple → quad),
+`wordplay` (adds code-generated hidden-word hypotheses: STARTING WITH coins, ENDING IN
+metals, X PLUS A LETTER), and `blanks` (default; adds fill-in-the-blank hypotheses from a
+phrase dictionary of two-word Wikipedia titles, `data/phrases.txt.gz`, rebuilt with
+`scripts/build_phrases.py`).
+
+Offline benchmark against past puzzles (answers cached in `bench-data/`, so re-runs are free):
+
+```bash
+./bench_jev.py --strategy blanks --last 50          # solve rate on the 50 most recent puzzles
+./bench_jev.py --strategy blanks --ids 1188 -v      # one puzzle, every guess and Jev call
+```
+
+On the 50 most recent puzzles: pairwise 21/50, beam 28/50, wordplay 33/50, blanks 38/50.
+
 ## Troubleshooting
 
 **"No image found"**: Make sure you're in the media viewer with an image open

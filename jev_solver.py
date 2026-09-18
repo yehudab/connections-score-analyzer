@@ -656,20 +656,32 @@ class JevBeamStrategy:
     # -- stages ------------------------------------------------------------------
 
     MAX_QUESTIONS_PER_REQUEST = 200  # ~30k tokens for 13-option Choices; API caps at 64k
+    PARALLEL_REQUESTS = 6
 
     def _stage(self, name: str, board: list[str], questions: dict) -> StageResult:
         """Run one stage, splitting into several requests if it is too large."""
         ids = list(questions)
-        if len(ids) <= self.MAX_QUESTIONS_PER_REQUEST:
+        per = self.MAX_QUESTIONS_PER_REQUEST
+        if len(ids) <= per:
             return self._request(name, board, questions)
+        chunks = [
+            (f"{name}[{c}]", {q: questions[q] for q in ids[start : start + per]})
+            for c, start in enumerate(range(0, len(ids), per))
+        ]
+        # Chunks are independent: run them concurrently (the API allows 1200 rpm).
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=self.PARALLEL_REQUESTS) as pool:
+            results = list(pool.map(lambda c: self._request(c[0], board, c[1]), chunks))
         merged: dict[str, dict] = {}
-        model, in_tok, out_tok, elapsed = "?", 0, 0, 0.0
-        for c, start in enumerate(range(0, len(ids), self.MAX_QUESTIONS_PER_REQUEST)):
-            chunk = {q: questions[q] for q in ids[start : start + self.MAX_QUESTIONS_PER_REQUEST]}
-            r = self._request(f"{name}[{c}]", board, chunk)
+        in_tok = out_tok = 0
+        elapsed = 0.0
+        for r in results:
             merged.update(r.answers)
-            model, in_tok, out_tok, elapsed = r.model, in_tok + r.input_tokens, out_tok + r.output_tokens, elapsed + r.elapsed_seconds
-        return StageResult(merged, model, in_tok, out_tok, round(elapsed, 2))
+            in_tok += r.input_tokens
+            out_tok += r.output_tokens
+            elapsed = max(elapsed, r.elapsed_seconds)  # wall-clock, since parallel
+        return StageResult(merged, results[-1].model, in_tok, out_tok, round(elapsed, 2))
 
     def _request(self, name: str, board: list[str], questions: dict) -> StageResult:
         import hashlib
@@ -1083,4 +1095,114 @@ class JevWordplayStrategy(JevBeamStrategy):
             g = frozenset(grp["members"])
             if g in self.wp_label:
                 grp["theme"] = f"jev wp {self.wp[g]:.2f} {self.wp_label[g]}"
+        return groups
+
+
+# ---------------------------------------------------------------------------
+# Wordplay + fill-in-the-blank hypotheses
+#
+# blanks.py finds candidate blanks in a phrase dictionary (Wikipedia titles):
+# common words that form a phrase with >= 3 board words on one side. Jev then
+# grades every (blank, board word) phrase with a Score question; per blank the
+# four strongest members form a hypothesis scored by its weakest member, and
+# hypotheses feed the same bonus mechanism as wordplay ones.
+# ---------------------------------------------------------------------------
+
+import blanks as _bl  # noqa: E402
+
+PHRASE_LEVELS = [
+    "Not a phrase; just two words placed together",
+    "Plausible but not a set expression",
+    "A recognizable phrase some people use",
+    "A fixed, well-known compound, expression, name, or title",
+]
+
+
+def phrase_score_question(member: str, blank: str, side: str) -> Score:
+    return Score(
+        instructions=f'How established is "{_bl.phrase(member, blank, side)}" as a phrase?',
+        criteria=PHRASE_LEVELS,
+    )
+
+
+class JevBlankStrategy(JevWordplayStrategy):
+    """JevWordplayStrategy plus fill-in-the-blank hypotheses."""
+
+    def __init__(
+        self,
+        *,
+        bl_cap: int = 400,
+        bl_min_members: int = 3,
+        bl_weight: float = 3.0,
+        bl_threshold: float = 0.8,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.bl_cap = bl_cap
+        self.bl_min_members = bl_min_members
+        self.bl_weight = bl_weight
+        self.bl_threshold = bl_threshold
+        self.bl: dict[frozenset[str], float] = {}
+        self.bl_label: dict[frozenset[str], str] = {}
+        self.bl_cands: list[_bl.BlankCandidate] = []
+        # (blank, side, word) -> P(level >= 2): "at least a recognizable phrase".
+        # The minimum over four members separates real blank groups from
+        # accidental Wikipedia-title matches far better than P(top level).
+        self.bl_pair: dict[tuple[str, str, str], float] = {}
+
+    def load_board(self, board: list[str]) -> None:
+        super().load_board(board)
+        self._load_blanks(list(board))
+
+    def _load_blanks(self, board: list[str]) -> None:
+        self.bl, self.bl_label, self.bl_pair = {}, {}, {}
+        self.bl_cands = _bl.candidate_blanks(board, min_members=self.bl_min_members, cap=self.bl_cap)
+        if not self.bl_cands:
+            self._log("blanks: no dictionary candidates")
+            return
+
+        # Stage V: grade every (blank, board word) phrase on the candidate's side.
+        qv: dict[str, Score] = {}
+        keys: dict[str, tuple[str, str, str]] = {}
+        for i, c in enumerate(self.bl_cands):
+            for j, w in enumerate(board):
+                qid = f"v{i}_{j}"
+                qv[qid] = phrase_score_question(w, c.blank, c.side)
+                keys[qid] = (c.blank, c.side, w)
+        rv = self._stage("stageV-phrases", board, qv)
+        for qid, key in keys.items():
+            probs = rv.answers[qid]["probabilities"]
+            self.bl_pair[key] = sum(v for lvl, v in probs.items() if int(lvl) >= 2)
+
+        for c in self.bl_cands:
+            scored = sorted(((self.bl_pair[(c.blank, c.side, w)], w) for w in board), reverse=True)
+            strong = [(p, w) for p, w in scored if p >= self.bl_threshold]
+            pool = scored[:4] if len(strong) < 4 else strong[:6]
+            for combo in itertools.combinations(pool, 4):
+                words = frozenset(w for _, w in combo)
+                score = min(p for p, _ in combo)
+                if score > self.bl.get(words, 0.0):
+                    pattern = f"___ {c.blank}" if c.side == "before" else f"{c.blank} ___"
+                    self.bl[words] = score
+                    self.bl_label[words] = f"blank:{pattern} score={score:.2f}"
+
+        if self.verbose:
+            self._log(
+                f"blanks: {len(self.bl_cands)} dictionary candidates ({len(qv)} phrase questions); top:"
+            )
+            for g, sc in sorted(self.bl.items(), key=lambda kv: kv[1], reverse=True)[:6]:
+                self._log(f"  {sc:.2f}  {sorted(g, key=board.index)}  <- {self.bl_label[g]}")
+
+    def subset_score(self, g: frozenset[str]) -> float:
+        s = self.bl.get(g, 0.0)
+        thr = self.bl_threshold
+        bonus = self.bl_weight * (s - thr) / (1.0 - thr) if s > thr else 0.0
+        return super().subset_score(g) + bonus
+
+    def __call__(self, remaining: list[str], failed_guesses: list[dict] | None = None) -> list[dict]:
+        groups = super().__call__(remaining, failed_guesses)
+        for grp in groups:
+            g = frozenset(grp["members"])
+            if g in self.bl_label and self.bl[g] > self.bl_threshold and not grp["theme"].startswith("jev wp"):
+                grp["theme"] = f"jev bl {self.bl[g]:.2f} {self.bl_label[g]}"
         return groups

@@ -11,7 +11,11 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scorer.py app.py connections_solver.py jev_solver.py wordplay.py ./
+COPY scorer.py app.py connections_solver.py jev_solver.py wordplay.py blanks.py ./
+COPY data/phrases.txt.gz ./data/
+
+# Index the phrase dictionary now so the first /solve does not pay the ~10s build
+RUN python -c "import blanks; blanks.phrase_index()"
 
 RUN mkdir -p /data /app/solver-images
 

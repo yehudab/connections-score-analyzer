@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 from connections_solver import MAX_MISTAKES, _load_env_file
-from jev_solver import JevBeamStrategy, JevStrategy, JevWordplayStrategy, OBJECTIVES
+from jev_solver import JevBeamStrategy, JevBlankStrategy, JevStrategy, JevWordplayStrategy, OBJECTIVES
 
 _load_env_file()
 
@@ -169,14 +169,16 @@ def run_puzzle(puzzle: dict, cache: dict, args: argparse.Namespace) -> dict:
     board = [w for a in puzzle["answers"] for w in a["members"]]
     random.Random(f"{args.seed}:{puzzle['id']}").shuffle(board)
 
-    if args.strategy in ("beam", "wordplay"):
-        cls = JevWordplayStrategy if args.strategy == "wordplay" else JevBeamStrategy
-        extra = (
-            dict(wp_weight=args.wp_weight, wp_verify=args.wp_verify,
-                 wp_threshold=args.wp_threshold, wp_verify_mode=args.wp_verify_mode,
-                 wp_duels=not args.no_duels)
-            if args.strategy == "wordplay" else {}
-        )
+    if args.strategy in ("beam", "wordplay", "blanks"):
+        cls = {"beam": JevBeamStrategy, "wordplay": JevWordplayStrategy, "blanks": JevBlankStrategy}[args.strategy]
+        extra = {}
+        if args.strategy in ("wordplay", "blanks"):
+            extra.update(wp_weight=args.wp_weight, wp_verify=args.wp_verify,
+                         wp_threshold=args.wp_threshold, wp_verify_mode=args.wp_verify_mode,
+                         wp_duels=not args.no_duels)
+        if args.strategy == "blanks":
+            extra.update(bl_cap=args.bl_cap, bl_min_members=args.bl_min_members,
+                         bl_weight=args.bl_weight, bl_threshold=args.bl_threshold)
         strategy = cls(
             **extra,
             triple_beam=args.beam_triples,
@@ -252,8 +254,12 @@ def main() -> None:
     ap.add_argument("--last", type=int, default=50, help="use the N most recent puzzles (default 50)")
     ap.add_argument("--before", metavar="YYYY-MM-DD", help="only puzzles dated strictly before this")
     ap.add_argument("--ids", help="comma-separated puzzle ids (overrides --last/--before)")
-    ap.add_argument("--strategy", choices=["pairwise", "beam", "wordplay"], default="pairwise",
-                    help="pairwise: 120 Nouls; beam: staged Choice questions; wordplay: beam + code-generated hidden-word hypotheses")
+    ap.add_argument("--strategy", choices=["pairwise", "beam", "wordplay", "blanks"], default="pairwise",
+                    help="pairwise: 120 Nouls; beam: staged Choice questions; wordplay: beam + hidden-word hypotheses; blanks: wordplay + fill-in-the-blank hypotheses")
+    ap.add_argument("--bl-cap", type=int, default=400, help="(blanks) max dictionary candidates verified")
+    ap.add_argument("--bl-min-members", type=int, default=3, help="(blanks) board words a candidate must pair with")
+    ap.add_argument("--bl-weight", type=float, default=3.0, help="(blanks) bonus weight")
+    ap.add_argument("--bl-threshold", type=float, default=0.8, help="(blanks) min over members of P(phrase level >= 2)")
     ap.add_argument("--wp-weight", type=float, default=3.0, help="(wordplay) weight of a verified hypothesis")
     ap.add_argument("--wp-verify", type=int, default=600, help="(wordplay) hypotheses sent to verification")
     ap.add_argument("--wp-threshold", type=float, default=0.6, help="(wordplay) min verified score to count")

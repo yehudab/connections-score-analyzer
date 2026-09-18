@@ -11,8 +11,9 @@ Pipeline:
   4. Ask a solver strategy to group them:
        - openrouter (default): an LLM via OpenRouter returns groups WITH
          pre-computed "one away" alternatives
-       - jev: TypeSafe's Jev model scores every word pair once; grouping and
-         feedback handling happen in code (see jev_solver.py)
+       - jev: TypeSafe's Jev model answers typed questions about the words;
+         grouping, wordplay/blank hypothesis generation and feedback handling
+         happen in code (see jev_solver.py, wordplay.py, blanks.py)
   5. Iteratively submit groups:
        - Correct: remove tiles from board, move on
        - "One Away": use pre-computed alternative swaps, else re-ask the strategy
@@ -36,6 +37,7 @@ Environment:
     OPENROUTER_API_KEY   required for the openrouter solver
     OPENROUTER_MODEL     optional — model to use (default: google/gemini-2.5-pro)
     TYPESAFE_API_KEY     required for the jev solver
+    JEV_STRATEGY         optional — blanks (default), wordplay, beam, or pairwise
 
 Requirements:
     pip install playwright openai
@@ -348,9 +350,9 @@ def make_strategy(solver: str, *, debug: bool = False):
         return make_openrouter_strategy(model)
     if solver == "jev":
         # lazy import: typesafe-sdk is only needed for this path
-        from jev_solver import JevBeamStrategy, JevStrategy, JevWordplayStrategy
+        from jev_solver import JevBeamStrategy, JevBlankStrategy, JevStrategy, JevWordplayStrategy
 
-        variant = os.environ.get("JEV_STRATEGY", "wordplay").strip().lower()
+        variant = os.environ.get("JEV_STRATEGY", "blanks").strip().lower()
         common = dict(
             model=os.environ.get("TYPESAFE_DEFAULT_MODEL"),
             debug_dir=SOLVER_DEBUG_DIR if debug else None,
@@ -361,7 +363,9 @@ def make_strategy(solver: str, *, debug: bool = False):
             return JevBeamStrategy(**common)
         if variant == "wordplay":
             return JevWordplayStrategy(**common)
-        raise ValueError(f"unknown JEV_STRATEGY {variant!r}; choose 'wordplay', 'beam' or 'pairwise'")
+        if variant == "blanks":
+            return JevBlankStrategy(**common)
+        raise ValueError(f"unknown JEV_STRATEGY {variant!r}; choose 'blanks', 'wordplay', 'beam' or 'pairwise'")
     raise ValueError(f"unknown solver {solver!r}; choose from {SOLVERS}")
 
 

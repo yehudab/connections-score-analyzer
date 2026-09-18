@@ -26,3 +26,7 @@ dev.db
 
 # Offline benchmark data and cached Jev answers
 bench-data/
+
+# SQLite index of the phrase dictionary (built on first use from data/phrases.txt.gz)
+data/phrases.sqlite
+data/phrases.building
