@@ -599,12 +599,15 @@ def missing():
 
 
 def _log_startup_config():
+    solver = os.environ.get("SOLVER", "openrouter (default)")
     model = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-pro (default)")
     has_or_key = bool(os.environ.get("OPENROUTER_API_KEY"))
+    has_ts_key = bool(os.environ.get("TYPESAFE_API_KEY"))
     has_lp_token = bool(os.environ.get("LIGHTPANDA_TOKEN"))
     print(
-        f"[scorer] startup — model={model}"
+        f"[scorer] startup — solver={solver} openrouter_model={model}"
         f" OPENROUTER_API_KEY={'set' if has_or_key else 'MISSING'}"
+        f" TYPESAFE_API_KEY={'set' if has_ts_key else 'MISSING'}"
         f" LIGHTPANDA_TOKEN={'set' if has_lp_token else 'MISSING'}",
         flush=True,
     )

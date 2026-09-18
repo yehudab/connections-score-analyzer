@@ -8,11 +8,15 @@ Pipeline:
   1. Connect to a CDP server (Lightpanda or Chrome) at the given WebSocket URL
   2. Open the NYT Connections page via Playwright
   3. Scrape the 16 tile words from the DOM
-  4. Ask an LLM (via OpenRouter) to group them, WITH pre-computed "one away" alternatives
+  4. Ask a solver strategy to group them:
+       - openrouter (default): an LLM via OpenRouter returns groups WITH
+         pre-computed "one away" alternatives
+       - jev: TypeSafe's Jev model scores every word pair once; grouping and
+         feedback handling happen in code (see jev_solver.py)
   5. Iteratively submit groups:
        - Correct: remove tiles from board, move on
-       - "One Away": use pre-computed alternative swaps from the LLM
-       - Completely wrong: re-ask LLM with failure history
+       - "One Away": use pre-computed alternative swaps, else re-ask the strategy
+       - Completely wrong: re-ask the strategy with failure history
   6. Screenshot the completed board
 
 Usage:
@@ -21,12 +25,17 @@ Usage:
     # Use Playwright's bundled Chromium instead of Lightpanda:
     python connections_solver.py --no-cdp --headed
 
+    # Solve with Jev instead of OpenRouter:
+    python connections_solver.py --solver jev --no-cdp
+
     # Verbose LLM logging + debug screenshots:
     python connections_solver.py --debug
 
 Environment:
-    OPENROUTER_API_KEY   required — your OpenRouter API key
-    OPENROUTER_MODEL     optional — model to use (default: google/gemini-2.5-flash)
+    SOLVER               optional — "openrouter" (default) or "jev"
+    OPENROUTER_API_KEY   required for the openrouter solver
+    OPENROUTER_MODEL     optional — model to use (default: google/gemini-2.5-pro)
+    TYPESAFE_API_KEY     required for the jev solver
 
 Requirements:
     pip install playwright openai
@@ -313,6 +322,56 @@ Required JSON format:
 
 
 # ---------------------------------------------------------------------------
+# Solver strategies
+#
+# A strategy is a callable:  strategy(remaining_words, failed_guesses) -> groups
+# where groups is an ordered list of {"theme", "members", "alternatives"} dicts.
+# play_game() only talks to the strategy, so the browser code is shared.
+# ---------------------------------------------------------------------------
+
+SOLVERS = ("openrouter", "jev")
+DEFAULT_SOLVER = "openrouter"
+
+
+def make_openrouter_strategy(model: str):
+    def strategy(remaining: list[str], failed_guesses: list[dict] | None = None) -> list[dict]:
+        return solve_with_llm(remaining, model, failed_guesses)
+
+    strategy.model_used = model  # type: ignore[attr-defined]
+    return strategy
+
+
+def make_strategy(solver: str, *, debug: bool = False):
+    """Build the strategy named by `solver` ("openrouter" or "jev")."""
+    if solver == "openrouter":
+        model = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
+        return make_openrouter_strategy(model)
+    if solver == "jev":
+        # lazy import: typesafe-sdk is only needed for this path
+        from jev_solver import JevBeamStrategy, JevStrategy
+
+        variant = os.environ.get("JEV_STRATEGY", "beam").strip().lower()
+        common = dict(
+            model=os.environ.get("TYPESAFE_DEFAULT_MODEL"),
+            debug_dir=SOLVER_DEBUG_DIR if debug else None,
+        )
+        if variant == "pairwise":
+            return JevStrategy(**common)
+        if variant == "beam":
+            return JevBeamStrategy(**common)
+        raise ValueError(f"unknown JEV_STRATEGY {variant!r}; choose 'beam' or 'pairwise'")
+    raise ValueError(f"unknown solver {solver!r}; choose from {SOLVERS}")
+
+
+def solver_from_env() -> str:
+    return os.environ.get("SOLVER", DEFAULT_SOLVER).strip().lower()
+
+
+def required_key_for(solver: str) -> str:
+    return "TYPESAFE_API_KEY" if solver == "jev" else "OPENROUTER_API_KEY"
+
+
+# ---------------------------------------------------------------------------
 # Game interaction
 # ---------------------------------------------------------------------------
 
@@ -457,17 +516,17 @@ async def submit_group(page, members: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def play_game(page, tiles: list[str], model: str) -> tuple[bool, int, list[dict]]:
+async def play_game(page, tiles: list[str], strategy) -> tuple[bool, int, list[dict]]:
     """
-    Play the game iteratively.
+    Play the game iteratively using `strategy(remaining, failed_guesses) -> groups`.
     Returns (success, mistakes, solved_groups) where solved_groups is a list of
     {"theme": ..., "members": [...]} dicts for each correctly guessed group.
 
     Retry strategy:
-    - "One Away": apply the LLM's pre-computed alternative swap (no extra
+    - "One Away": apply the group's pre-computed alternative swap (no extra
       blind guesses needed). Falls back to a re-solve if alternatives are
       exhausted or invalid.
-    - Completely wrong: re-ask LLM with full failure history as context.
+    - Completely wrong: re-ask the strategy with full failure history as context.
     """
     remaining: list[str] = list(tiles)
     mistakes = 0
@@ -476,12 +535,12 @@ async def play_game(page, tiles: list[str], model: str) -> tuple[bool, int, list
     failed_guesses: list[dict] = []
     tried_sets: set[frozenset] = set()   # Python-enforced dedup — LLM can't be trusted
 
-    groups = solve_with_llm(remaining, model)
+    groups = strategy(remaining)
 
     while remaining and mistakes < MAX_MISTAKES:
         if not groups:
             print("  (Re-solving — queue empty ...)")
-            groups = solve_with_llm(remaining, model, failed_guesses)
+            groups = strategy(remaining, failed_guesses)
 
         group = groups.pop(0)
         members = list(group["members"])
@@ -498,7 +557,7 @@ async def play_game(page, tiles: list[str], model: str) -> tuple[bool, int, list
         if key in tried_sets:
             print(f"  [skip] already tried: {members}")
             if not groups:
-                groups = solve_with_llm(remaining, model, failed_guesses)
+                groups = strategy(remaining, failed_guesses)
             continue
         tried_sets.add(key)
 
@@ -543,13 +602,13 @@ async def play_game(page, tiles: list[str], model: str) -> tuple[bool, int, list
                 else:
                     if mistakes < MAX_MISTAKES:
                         print(f"    → Alt invalid ({alt}), re-solving ...")
-                        groups = solve_with_llm(remaining, model, failed_guesses)
+                        groups = strategy(remaining, failed_guesses)
                     else:
                         print(f"    → Alt invalid ({alt}) — no attempts left.")
             else:
                 if mistakes < MAX_MISTAKES:
                     print("    → No alternatives, re-solving ...")
-                    groups = solve_with_llm(remaining, model, failed_guesses)
+                    groups = strategy(remaining, failed_guesses)
                 else:
                     print("    → No alternatives — no attempts left.")
 
@@ -558,7 +617,7 @@ async def play_game(page, tiles: list[str], model: str) -> tuple[bool, int, list
             failed_guesses.append({"members": members, "feedback": "wrong"})
             if mistakes < MAX_MISTAKES:
                 print(f"    ✗ Wrong. ({mistakes}/{MAX_MISTAKES} mistakes) Re-solving ...")
-                groups = solve_with_llm(remaining, model, failed_guesses)
+                groups = strategy(remaining, failed_guesses)
             else:
                 print(f"    ✗ Wrong. ({mistakes}/{MAX_MISTAKES} mistakes) — no attempts left.")
 
@@ -582,18 +641,23 @@ async def solve(
     headed: bool = False,
     cdp_url: str | None = None,
     debug: bool = False,
+    solver: str | None = None,
 ) -> dict:
     """
     Run the solver and return a result dict with keys:
-      success, groups, mistakes, elapsed_seconds, model, image_path
+      success, groups, mistakes, elapsed_seconds, solver, model, image_path
+
+    `solver` is "openrouter" or "jev"; defaults to the SOLVER env var.
     """
     import time
     global DEBUG
     DEBUG = debug
 
     start_time = time.monotonic()
-    model = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
-    print(f"Model: {model}")
+    solver = (solver or solver_from_env())
+    strategy = make_strategy(solver, debug=debug)
+    model = getattr(strategy, "model_used", None) or solver
+    print(f"Solver: {solver}  Model: {model}")
 
     async with async_playwright() as pw:
         if no_cdp:
@@ -660,7 +724,7 @@ async def solve(
 
             print(f"Tiles: {tiles}\n")
 
-            success, mistakes, solved_groups = await play_game(page, tiles, model)
+            success, mistakes, solved_groups = await play_game(page, tiles, strategy)
 
             elapsed = time.monotonic() - start_time
             SOLVER_IMAGES_DIR.mkdir(exist_ok=True)
@@ -673,7 +737,9 @@ async def solve(
                 "groups": solved_groups,
                 "mistakes": mistakes,
                 "elapsed_seconds": round(elapsed, 1),
-                "model": model,
+                "solver": solver,
+                # Jev reports the versioned model that actually answered
+                "model": getattr(strategy, "model_used", None) or model,
                 "image_path": image_path,
             }
 
@@ -688,6 +754,7 @@ async def run(args: argparse.Namespace) -> None:
         headed=args.headed,
         cdp_url=args.cdp_url,
         debug=args.debug,
+        solver=args.solver,
     )
     print(json.dumps(result, indent=2))
 
@@ -696,7 +763,13 @@ def main() -> None:
     global DEBUG
 
     parser = argparse.ArgumentParser(
-        description="Solve NYT Connections using Lightpanda CDP + OpenRouter LLM"
+        description="Solve NYT Connections using Lightpanda CDP + an LLM (OpenRouter) or Jev (TypeSafe)"
+    )
+    parser.add_argument(
+        "--solver",
+        choices=SOLVERS,
+        default=solver_from_env(),
+        help="Grouping strategy (default: $SOLVER or 'openrouter')",
     )
     parser.add_argument(
         "--cdp-url",
@@ -726,8 +799,9 @@ def main() -> None:
     args = parser.parse_args()
     DEBUG = args.debug
 
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        print("Error: OPENROUTER_API_KEY is not set.", file=sys.stderr)
+    key = required_key_for(args.solver)
+    if not os.environ.get(key):
+        print(f"Error: {key} is not set (required by the {args.solver} solver).", file=sys.stderr)
         sys.exit(1)  # intentional: CLI entry point, not called from the web server
 
     asyncio.run(run(args))

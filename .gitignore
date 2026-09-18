@@ -23,3 +23,6 @@ __pycache__/
 
 # Test DB
 dev.db
+
+# Offline benchmark data and cached Jev answers
+bench-data/

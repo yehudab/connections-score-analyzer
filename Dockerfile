@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scorer.py app.py connections_solver.py ./
+COPY scorer.py app.py connections_solver.py jev_solver.py ./
 
 RUN mkdir -p /data /app/solver-images
 
