@@ -589,6 +589,32 @@ class StageResult:
         )
 
 
+def average_results(samples: list["StageResult"]) -> "StageResult":
+    """Element-wise mean of identical requests' answers (probabilities, nouls, scores)."""
+    if len(samples) == 1:
+        return samples[0]
+    n = len(samples)
+    merged: dict[str, dict] = {}
+    for qid in samples[0].answers:
+        per = [s.answers[qid] for s in samples if qid in s.answers]
+        out: dict = {}
+        if "probabilities" in per[0]:
+            keys = set().union(*(a["probabilities"] for a in per))
+            out["probabilities"] = {k: sum(a["probabilities"].get(k, 0.0) for a in per) / len(per) for k in keys}
+        if "noul" in per[0]:
+            out["noul"] = sum(a["noul"] for a in per) / len(per)
+        if "score" in per[0]:
+            out["score"] = sum(a["score"] for a in per) / len(per)
+        merged[qid] = out
+    return StageResult(
+        answers=merged,
+        model=samples[-1].model,
+        input_tokens=sum(s.input_tokens for s in samples),
+        output_tokens=sum(s.output_tokens for s in samples),
+        elapsed_seconds=round(max(s.elapsed_seconds for s in samples), 2),
+    )
+
+
 def run_stage(client: TypeSafeClient, board: list[str], questions: dict) -> StageResult:
     state = {"rules": GAME_RULES, "board": list(board)}
     t0 = time.monotonic()
@@ -649,10 +675,12 @@ class JevBeamStrategy:
         affinity_cache: dict[str, dict] | None = None,
         debug_dir: Path | None = None,
         verbose: bool = True,
+        repeats: int = 1,
     ) -> None:
         self._client = client
         self._model = model
         self._timeout = timeout
+        self.repeats = max(1, int(repeats))
         self.triple_beam = triple_beam
         self.verify_quads = verify_quads
         self.weights = weights
@@ -685,6 +713,10 @@ class JevBeamStrategy:
 
     MAX_QUESTIONS_PER_REQUEST = 200  # ~30k tokens for 13-option Choices; API caps at 64k
     PARALLEL_REQUESTS = 6
+    # Self-consistency: identical Jev requests drift (top choice flips on ~20% of
+    # questions, probabilities move by up to 0.14). Asking each chunk `repeats`
+    # times and averaging the distributions damps that; 1 = single sample.
+    repeats: int = 1
 
     def _stage(self, name: str, board: list[str], questions: dict) -> StageResult:
         """Run one stage, splitting into several requests if it is too large."""
@@ -712,10 +744,22 @@ class JevBeamStrategy:
         return StageResult(merged, results[-1].model, in_tok, out_tok, round(elapsed, 2))
 
     def _request(self, name: str, board: list[str], questions: dict) -> StageResult:
+        """One logical request; with repeats > 1, several identical calls averaged."""
+        if self.repeats <= 1:
+            return self._request_once(name, board, questions, 0)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=self.repeats) as pool:
+            samples = list(pool.map(lambda i: self._request_once(name, board, questions, i), range(self.repeats)))
+        return average_results(samples)
+
+    def _request_once(self, name: str, board: list[str], questions: dict, sample: int) -> StageResult:
         import hashlib
 
         qkey = hashlib.sha1(json.dumps(sorted(questions), sort_keys=True).encode()).hexdigest()[:10]
-        key = f"beam:{beam_prompt_version()}:{name}:{qkey}#" + "|".join(sorted(board))
+        # sample 0 keeps the historical key so earlier cached answers still count
+        suffix = "" if sample == 0 else f":s{sample}"
+        key = f"beam:{beam_prompt_version()}:{name}{suffix}:{qkey}#" + "|".join(sorted(board))
         cached = self.affinity_cache.get(key) if self.affinity_cache is not None else None
         if cached is not None:
             result = StageResult.from_json(cached)

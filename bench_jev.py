@@ -198,6 +198,7 @@ def run_puzzle(puzzle: dict, cache: dict, args: argparse.Namespace) -> dict:
             extra.update(bl_cap=args.bl_cap, bl_min_members=args.bl_min_members,
                          bl_weight=args.bl_weight, bl_threshold=args.bl_threshold)
         strategy = cls(
+            repeats=args.repeats,
             **extra,
             triple_beam=args.beam_triples,
             verify_quads=args.verify_quads,
@@ -290,6 +291,7 @@ def main() -> None:
     ap.add_argument("--weights", default="1,1,2,2", help="(beam) pair,triple,quad,noul weights")
     ap.add_argument("--seed", default="bench", help="board shuffle seed")
     ap.add_argument("--timeout", type=float, default=120.0)
+    ap.add_argument("--repeats", type=int, default=1, help="ask each Jev request N times and average (self-consistency)")
     ap.add_argument("--price", type=float, default=0.042, help="$ per Mtok input, for the cost estimate")
     ap.add_argument("--no-cache", action="store_true", help="ignore and do not write the answer cache")
     ap.add_argument("--cache", default=str(CACHE_PATH), help="answer cache file (default bench-data/jev_cache.json)")

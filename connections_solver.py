@@ -409,6 +409,7 @@ def make_strategy(solver: str, *, debug: bool = False):
         )
         if variant == "pairwise":
             return JevStrategy(**common)
+        common["repeats"] = int(os.environ.get("JEV_REPEATS", "1"))
         if variant == "beam":
             return JevBeamStrategy(**common)
         if variant == "wordplay":
