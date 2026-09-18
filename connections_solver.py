@@ -88,6 +88,7 @@ SOLVER_DEBUG_DIR = Path(__file__).parent / "solver-debug"
 SOLVER_IMAGES_DIR = Path(__file__).parent / "solver-images"
 
 TILE_SELECTORS = [
+    'label[class*="Card-module_label"]',   # Sept 2026 markup: <label><span aria-hidden>W</span><span>W</span></label>
     '[data-testid="card-label"]',
     '[data-testid="card"] span',
     '.cell-text',
@@ -98,8 +99,27 @@ TILE_SELECTORS = [
     '[class*="Tile"] span',
 ]
 
+# JS helper: the word shown on a tile element. Newer NYT markup duplicates the
+# word in an aria-hidden span, so prefer the visible span and, failing that,
+# collapse an exactly doubled string ("PILLOWPILLOW" -> "PILLOW").
+_TILE_TEXT_JS = """
+    const norm = s => s.replace(/\\s+/g, ' ').trim();
+    const tileText = el => {
+        const visible = Array.from(el.querySelectorAll('span')).find(s => !s.hasAttribute('aria-hidden'));
+        let t = norm(visible ? visible.textContent : el.textContent);
+        const h = t.length / 2;
+        if (!visible && t.length % 2 === 0 && h > 0 && t.slice(0, h) === t.slice(h)) t = t.slice(0, h);
+        return t;
+    };
+    const clickable = el => el.closest('label') || el.closest('button') || el;
+"""
+_TILE_SELECTORS_JS = json.dumps(TILE_SELECTORS)
+
 # NYT gives 4 mistakes before game over
 MAX_MISTAKES = 4
+
+# How long to wait for the 16 tiles to render after clicking Play
+TILE_WAIT_SECONDS = 30
 
 # Global debug flag (set in main)
 DEBUG = False
@@ -146,12 +166,17 @@ async def dismiss_overlays(page) -> None:
         'button:text("Accept All")',
         'button:text("Play")',
         'button:text("Play!")',
+        # Sept 2026: an ad/upsell interstitial after Play with a countdown button
+        'button:has-text("Continue to Connections")',
+        'button:has-text("Continue")',
     ]
     for selector in candidates:
         try:
             btn = page.locator(selector).first
             if await btn.is_visible(timeout=400):
-                await btn.click()
+                # Short timeout: a countdown button may still be disabled; the
+                # caller polls and we will try again on the next pass.
+                await btn.click(timeout=3000)
                 await page.wait_for_timeout(600)
         except Exception:
             pass
@@ -169,7 +194,7 @@ async def extract_tiles(page) -> list[str]:
         try:
             tiles = await page.eval_on_selector_all(
                 selector,
-                "els => els.map(el => el.textContent.replace(/\\s+/g, ' ').trim()).filter(t => t.length > 0)",
+                "els => {" + _TILE_TEXT_JS + " return els.map(tileText).filter(t => t.length > 0); }",
             )
             if len(tiles) == 16:
                 return tiles
@@ -383,27 +408,14 @@ def required_key_for(solver: str) -> str:
 
 
 def _find_tile_js() -> str:
-    """JS snippet that returns the button element for a given word, or null."""
-    return """(word) => {
-        const norm = s => s.replace(/\\s+/g, ' ').trim();
-        const labelSelectors = [
-            '[data-testid="card-label"]',
-            '[data-testid="card"] span',
-            '.cell-text',
-            '[class*="Card"] [class*="label"]',
-            '[class*="card"] [class*="label"]',
-            '[class*="Cell"] span',
-            '[class*="cell"] span',
-            '[class*="Tile"] span',
-        ];
-        for (const sel of labelSelectors) {
-            const el = Array.from(document.querySelectorAll(sel))
-                .find(el => norm(el.textContent) === word);
-            if (el) return el.closest('button') || el;
+    """JS snippet that returns the clickable element for a given word, or null."""
+    return """(word) => {""" + _TILE_TEXT_JS + """
+        for (const sel of """ + _TILE_SELECTORS_JS + """) {
+            const el = Array.from(document.querySelectorAll(sel)).find(el => tileText(el) === word);
+            if (el) return clickable(el);
         }
-        // Fallback: button whose normalised textContent matches exactly
-        return Array.from(document.querySelectorAll('button'))
-            .find(b => norm(b.textContent) === word) || null;
+        // Fallback: button whose text matches exactly
+        return Array.from(document.querySelectorAll('button')).find(b => tileText(b) === word) || null;
     }"""
 
 
@@ -481,21 +493,17 @@ async def wait_for_board_ready(page, members: list[str]) -> None:
     """Wait until the first tile of the next group is visible and fully interactive."""
     word = members[0]
     await page.wait_for_function(
-        """(word) => {
-            const norm = s => s.replace(/\\s+/g, ' ').trim();
-            const labelSelectors = [
-                '[data-testid="card-label"]',
-                '[class*="Card"] [class*="label"]',
-                '[class*="Cell"] span',
-            ];
-            for (const sel of labelSelectors) {
-                const el = Array.from(document.querySelectorAll(sel))
-                    .find(e => norm(e.textContent) === word);
+        """(word) => {""" + _TILE_TEXT_JS + """
+            for (const sel of """ + _TILE_SELECTORS_JS + """) {
+                const el = Array.from(document.querySelectorAll(sel)).find(e => tileText(e) === word);
                 if (el) {
-                    const btn = el.closest('button') || el;
-                    // Check both the DOM disabled property and aria-disabled attribute
-                    const ariaDisabled = btn.getAttribute('aria-disabled');
-                    return !btn.disabled && ariaDisabled !== 'true';
+                    const target = clickable(el);
+                    // A <label> tile is disabled through its associated input
+                    const ctl = target.tagName === 'LABEL'
+                        ? (target.control || document.getElementById(target.htmlFor) || target.querySelector('input'))
+                        : target;
+                    if (ctl && ctl.disabled) return false;
+                    return target.getAttribute('aria-disabled') !== 'true';
                 }
             }
             return false;
@@ -710,23 +718,32 @@ async def solve(
             print("  Clicked Play")
             await page.wait_for_timeout(1000)
 
+            # The board can take a few seconds to render behind NYT's splash
+            # screen / upsell interstitials. Poll for the 16 tiles instead of
+            # trusting the first scrape, re-dismissing overlays in between.
+            print("Extracting tiles ...")
+            tiles: list[str] = []
+            for attempt in range(TILE_WAIT_SECONDS):
+                tiles = await extract_tiles(page)
+                if len(tiles) == 16:
+                    break
+                await dismiss_overlays(page)
+                await page.wait_for_timeout(1000)
+
             if debug:
                 SOLVER_DEBUG_DIR.mkdir(exist_ok=True)
                 debug_path = str(SOLVER_DEBUG_DIR / "loaded.png")
                 await page.screenshot(path=debug_path)
                 print(f"  Saved: {debug_path}")
 
-            print("Extracting tiles ...")
-            tiles = await extract_tiles(page)
-
             if len(tiles) != 16:
                 SOLVER_DEBUG_DIR.mkdir(exist_ok=True)
                 err_path = str(SOLVER_DEBUG_DIR / "no_tiles.png")
                 await page.screenshot(path=err_path)
-                msg = f"Expected 16 tiles, got {len(tiles)}: {tiles}"
-                print(msg, file=sys.stderr)
-                if not tiles:
-                    raise RuntimeError(msg)
+                raise RuntimeError(
+                    f"Expected 16 tiles after {TILE_WAIT_SECONDS}s, got {len(tiles)}: {tiles}"
+                    f" (screenshot: {err_path})"
+                )
 
             print(f"Tiles: {tiles}\n")
 

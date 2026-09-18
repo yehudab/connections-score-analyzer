@@ -1093,7 +1093,9 @@ class JevWordplayStrategy(JevBeamStrategy):
         groups = super().__call__(remaining, failed_guesses)
         for grp in groups:
             g = frozenset(grp["members"])
-            if g in self.wp_label:
+            # Only label a group as wordplay when the hypothesis actually
+            # contributed (scored above the threshold).
+            if g in self.wp_label and self.wp[g] > self.wp_threshold:
                 grp["theme"] = f"jev wp {self.wp[g]:.2f} {self.wp_label[g]}"
         return groups
 
