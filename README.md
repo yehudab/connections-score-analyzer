@@ -77,7 +77,21 @@ The generated CSV contains:
 
 ## Score Detection
 
-The algorithm detects:
+Current screenshots state the result in a Hebrew headline, read with Tesseract OCR
+(on macOS: `brew install tesseract tesseract-lang`):
+
+| Result | Score |
+|--------|-------|
+| 1 attempt, no hint | 8 |
+| 1 attempt, with hint | 7 |
+| 2-6 attempts, with or without hint | 8 - attempts |
+| Not solved | 1 |
+
+The title decides the score. A sentence naming the attempt must agree with it, and can
+stand in for a misread title from 2 attempts up. Otherwise the status is
+`failed:unrecognized_result` and the OCR text is logged.
+
+Older screenshots have no such headline, and are scored from their bars:
 - **Green bar** at any position → Score = 8 - position + 1
 - **Red bar** at bottom position → Score = 1
 
@@ -90,7 +104,9 @@ Validation ensures:
 
 ## Debug Images
 
-Debug images show:
+Current screenshots get a `<name>_debug.txt` with the score, headline and full OCR text.
+
+Debug images for older screenshots show:
 - Yellow border: Detected content card
 - Green boxes: Green bar with position
 - Red boxes: Red bar

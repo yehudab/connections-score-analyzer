@@ -17,7 +17,7 @@ import traceback
 
 from flask import Flask, request, jsonify, send_file
 
-from scorer import compute_score_from_bar_image
+from scorer import compute_score_from_image
 from connections_solver import solve as run_solver
 
 app = Flask(__name__)
@@ -292,7 +292,7 @@ def score():
         tmp_path = tmp.name
 
     try:
-        computed_score, status = compute_score_from_bar_image(tmp_path, save_debug=False)
+        computed_score, status = compute_score_from_image(tmp_path, save_debug=False)
     finally:
         os.unlink(tmp_path)
 
