@@ -1,9 +1,11 @@
 FROM python:3.13-slim
 
-# OpenCV runtime dependencies
+# OpenCV runtime dependencies, and Hebrew OCR for reading result screenshots
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
+    tesseract-ocr \
+    tesseract-ocr-heb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

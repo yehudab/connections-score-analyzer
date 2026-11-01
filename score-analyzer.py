@@ -12,7 +12,7 @@ from datetime import datetime, date
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
-from scorer import compute_score_from_bar_image
+from scorer import compute_score_from_image
 
 YOU = "Yehuda"
 
@@ -299,7 +299,7 @@ def main():
     for i, meta in enumerate(images_metadata, 1):
         print(f"\n[{i}/{len(images_metadata)}] Processing {meta['filename']}...", end=" ")
 
-        score, status = compute_score_from_bar_image(
+        score, status = compute_score_from_image(
             meta['filepath'],
             save_debug=True,
             debug_dir=debug_dir

@@ -1,15 +1,123 @@
 """
-Connections game score detection from bar chart images.
+Connections game score detection from result screenshots.
+
+Current screenshots state the result in a Hebrew headline, which is read with
+OCR. Older screenshots have no such headline, so they (and historical images
+passed through score-analyzer.py --rescore) are scored from their bar colors.
 """
 
+import logging
 import os
+import re
+
 import cv2
 import numpy as np
+import pytesseract
+
+logger = logging.getLogger(__name__)
+
+# All wording below comes from the game's own frontend code.
+# The title: "שלושה נסיונות עם רמז", "ניסיון אחד בלי רמז". Chart labels such as
+# "נסיון 1 בלי רמז" use digits, so they can't match.
+TITLE_RE = re.compile(
+    r"נ?י?סיון\s+(?P<one>אחד)"
+    r"|(?P<many>שני|שלושה|ארבעה|חמישה|שישה)\s+נ?י?סיונות"
+)
+TITLE_ATTEMPTS = {"אחד": 1, "שני": 2, "שלושה": 3, "ארבעה": 4, "חמישה": 5, "שישה": 6}
+# Tolerates OCR dropping the last letter of "רמז".
+HINT_RE = re.compile(r"(?P<word>עם|בלי)\s+רמ")
+# The title on a loss, and the sentence below it in one of the two loss variants.
+FAILED_RE = re.compile(r"לא\s+הצלחת")
+# Sentences that name the attempt: "בניסיון השלישי". They only ever refer to the
+# player's own result, so they double-check the title or stand in for a misread
+# one. Many sentences don't name it, and first-attempt ones may not use this form.
+ATTEMPT_SENTENCE_RE = re.compile(r"בניסיון\s+(הראשון|השני|השלישי|הרביעי|החמישי|השישי)")
+SENTENCE_ATTEMPTS = {
+    "הראשון": 1, "השני": 2, "השלישי": 3, "הרביעי": 4, "החמישי": 5, "השישי": 6,
+}
+# Other current-format text, to fail visibly if the OCR misses the result itself.
+# Older screenshots say "משתתפים היום" and have no personal stats section.
+FORMAT_MARKER_RE = re.compile(r"שחקנים\s+היום|התפלגות\s+ההצלחות")
+
+
+def score_from_ocr_text(text):
+    """
+    Score OCR text of a current-format screenshot.
+
+    Returns (score, status, headline), or None when the text isn't from a
+    current-format screenshot. The chart can be missing from a screenshot, so
+    the title is what's relied on.
+    """
+    lines = [
+        line.replace("\u200e", "").replace("\u200f", "").strip()
+        for line in text.splitlines()
+    ]
+    lines = [line for line in lines if line]
+    unrecognized = (None, "failed:unrecognized_result", " | ".join(lines)[:500])
+
+    failed = any(FAILED_RE.search(line) for line in lines)
+    title = next((line for line in lines if TITLE_RE.search(line)), None)
+
+    attempts = {SENTENCE_ATTEMPTS[m] for m in ATTEMPT_SENTENCE_RE.findall(text)}
+    if title is not None:
+        match = TITLE_RE.search(title)
+        attempts.add(TITLE_ATTEMPTS[match["one"] or match["many"]])
+
+    if not failed and not attempts:
+        if any(FORMAT_MARKER_RE.search(line) for line in lines):
+            return unrecognized
+        return None
+
+    # Disagreement means OCR misread something, so don't guess a score.
+    if failed:
+        return (1, "success", "לא הצלחת") if not attempts else unrecognized
+    if len(attempts) != 1:
+        return unrecognized
+    attempt = attempts.pop()
+
+    headline = title or f"attempt {attempt}"
+    if attempt > 1:
+        return 8 - attempt, "success", headline
+
+    # Only a first attempt is scored differently with and without a hint.
+    hint = HINT_RE.search(title or "")
+    if hint is None:
+        return unrecognized
+    return (8 if hint["word"] == "בלי" else 7), "success", headline
+
+
+def compute_score_from_image(image_path, save_debug=True, debug_dir='debug'):
+    """
+    Detect the Connections game score from a screenshot image.
+    Returns (score, status) where status is 'success' or 'failed:<reason>'
+    """
+    if cv2.imread(image_path) is None:
+        return None, "failed:cannot_read_image"
+
+    try:
+        text = pytesseract.image_to_string(image_path, lang="heb", config="--psm 6")
+    except (pytesseract.TesseractError, pytesseract.TesseractNotFoundError) as e:
+        logger.error("Hebrew OCR is unavailable: %s", e)
+        return None, "failed:ocr_unavailable"
+
+    result = score_from_ocr_text(text)
+    if result is None:
+        return compute_score_from_bar_image(image_path, save_debug=save_debug, debug_dir=debug_dir)
+
+    score, status, headline = result
+    if status != "success":
+        logger.warning("Unrecognized result headline in %s: %s", image_path, headline)
+    if save_debug:
+        os.makedirs(debug_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        with open(os.path.join(debug_dir, f"{base_name}_debug.txt"), "w", encoding="utf-8") as f:
+            f.write(f"score: {score}\nstatus: {status}\nheadline: {headline}\n\n{text}")
+    return score, status
 
 
 def compute_score_from_bar_image(image_path, save_debug=True, debug_dir='debug'):
     """
-    Detect the Connections game score from a screenshot image.
+    Detect the score of an older screenshot from its colored bar.
     Returns (score, status) where status is 'success' or 'failed:<reason>'
     """
     img = cv2.imread(image_path)
